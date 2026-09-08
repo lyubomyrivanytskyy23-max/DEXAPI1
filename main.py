@@ -5723,18 +5723,49 @@ def _build_loadstring(raw_url):
     return "loadstring(game:HttpGet(" + json.dumps(raw_url) + "))()"
 
 
-def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -> str:
-    """
-    Compact Lua protection wrapper.
+def _line_scaled_padding(source: str, current_payload: str, cap_bytes: int = 3_000_000) -> str:
+    """Add inert Lua comments so output size scales with the original source."""
+    line_count = max(1, source.count("\n") + 1)
+    target_bytes = min(line_count * 1000, cap_bytes)
+    current_bytes = len(current_payload.encode("utf-8"))
+    if current_bytes >= target_bytes:
+        return current_payload
+    remaining = target_bytes - current_bytes
+    pieces = []
+    counter = 0
+    while remaining > 0:
+        counter += 1
+        line = f"\n-- DEX inert padding {counter:06d}:{secrets.token_hex(12)}\n"
+        n = len(line.encode("utf-8"))
+        if n > remaining:
+            prefix = "\n-- DEX "
+            if remaining >= len(prefix.encode("utf-8")):
+                pieces.append(prefix + ("x" * (remaining - len(prefix.encode("utf-8")))))
+            break
+        pieces.append(line)
+        remaining -= n
+    return current_payload + "".join(pieces)
 
-    The previous implementation used ten full permutation/XOR/rotation rounds,
-    binary-token expansion, fragment shuffling, and artificial 128 KiB padding.
-    This version keeps the wrapper small while retaining basic integrity and
-    runtime sanity checks.
 
-    This is compatibility-oriented protection, not a guarantee against a
-    determined debugger/dumper. Client-side Lua can always be inspected by the
-    environment executing it.
+def _checksum32(data: bytes, seed: int) -> int:
+    """Small deterministic 32-bit integrity primitive for generated Lua."""
+    value = seed & 0xFFFFFFFF
+    for index, byte in enumerate(data, 1):
+        value ^= (byte + index * 17) & 0xFFFFFFFF
+        value = (value * 0x01000193) & 0xFFFFFFFF
+        value ^= (value >> 13)
+        value &= 0xFFFFFFFF
+    return value
+
+
+def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, size_source=None) -> str:
+    """Build a multi-layer, randomized Lua protection wrapper.
+
+    The executable payload is protected with two independent reversible
+    transforms, shuffled into independently keyed blocks, then reconstructed
+    and checked with two integrity values before execution.  `size_source`
+    lets the public API scale the final wrapper from the original source rather
+    than from its compact intermediate loader.
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -5743,86 +5774,133 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     source = source.strip()
     if not source:
         raise ValueError("Lua source is empty.")
-
     normalize_obf_level(level)
 
+    if size_source is None:
+        size_source = source
+    if not isinstance(size_source, str):
+        size_source = str(size_source)
+
     src = source.encode("utf-8")
-    key = _RNG.randint(1, 255)
+    seed_a = secrets.randbelow(250) + 1
+    seed_b = secrets.randbelow(250) + 1
+    stride = secrets.randbelow(23) + 7
+    block_size = secrets.randbelow(23) + 24
 
-    # One compact reversible byte stream. No ten-round cipher, token expansion,
-    # fragment shuffle, or padding.
-    encrypted = bytes(
-        (value + key + ((index * 31) & 0xFF)) & 0xFF
-        for index, value in enumerate(src)
+    # Layer 1: indexed additive transform.
+    layer1 = bytes(
+        (byte + seed_a + ((index * stride) & 0xFF)) & 0xFF
+        for index, byte in enumerate(src)
     )
+    # Layer 2: feedback/XOR-like reversible transform.
+    prev = seed_b
+    layer2_list = []
+    for index, byte in enumerate(layer1):
+        mixed = byte ^ prev
+        mixed = (mixed + ((index * 29 + seed_b) & 0xFF)) & 0xFF
+        layer2_list.append(mixed)
+        prev = mixed
+    encrypted = bytes(layer2_list)
 
-    checksum = 0x45D9
-    for index, value in enumerate(src, 1):
-        checksum = (checksum * 33 + value + index) & 0xFFFFFFFF
+    plain_a = _checksum32(src, 0x811C9DC5)
+    plain_b = _checksum32(src[::-1], 0x9E3779B9)
+    cipher_a = _checksum32(encrypted, 0xA5A5A5A5)
+    cipher_b = _checksum32(encrypted[::-1], 0xC3C3C3C3)
+
+    blocks = [encrypted[i:i + block_size].hex() for i in range(0, len(encrypted), block_size)] or [""]
+    order = list(range(len(blocks)))
+    secrets.SystemRandom().shuffle(order)
+    shuffled_blocks = [blocks[i] for i in order]
 
     used = set()
     N = lambda: _unique_name(used)
+    (V_TYPE, V_PCALL, V_LOAD, V_ERR, V_CHAR, V_LEN, V_SUB, V_TONUM,
+     V_CONCAT, V_DATA, V_OUT, V_I, V_J, V_VALUE, V_PREV, V_TMP,
+     V_A, V_B, V_CA, V_CB, V_PARTS, V_ORDER, V_BLOCK, V_POS, V_DEBUG,
+     V_OK, V_SOURCE, V_FN, V_T) = [N() for _ in range(28)]
 
-    V_CHAR, V_LEN, V_SUB, V_CONCAT = N(), N(), N(), N()
-    V_TONUM, V_LOAD, V_ERR, V_I, V_SUM = N(), N(), N(), N(), N()
-    V_DATA, V_OUT, V_VALUE, V_EXPECT = N(), N(), N(), N()
-    V_TYPE, V_PCALL, V_DEBUG, V_OK = N(), N(), N(), N()
-    V_SOURCE, V_FN = N(), N()
-
-    encoded = encrypted.hex()
+    block_literal = "{" + ",".join(repr(x) for x in shuffled_blocks) + "}"
+    order_literal = "{" + ",".join(str(x + 1) for x in order) + "}"
 
     lines = [
-        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
+        "-- This file was protected using Dex Obfuscator v5.3 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
         f"local {V_LOAD}=loadstring or load",
-        f"if {V_TYPE}(string)~='table' or {V_TYPE}(table)~='table' or {V_TYPE}({V_LOAD})~='function' then",
-        "if warn then warn('[DEX] Environment check failed: required Lua runtime functions are unavailable.') end",
-        "error('Unsupported Lua runtime')",
-        "end",
+        f"if {V_TYPE}(string)~='table' or {V_TYPE}(table)~='table' or {V_TYPE}({V_LOAD})~='function' then error('Unsupported Lua runtime') end",
         f"local {V_CHAR}=string.char",
         f"local {V_LEN}=string.len",
         f"local {V_SUB}=string.sub",
         f"local {V_TONUM}=tonumber",
         f"local {V_CONCAT}=table.concat",
-        f"local {V_DATA}='{encoded}'",
+        f"local {V_PARTS}={block_literal}",
+        f"local {V_ORDER}={order_literal}",
+        f"local {V_T}={seed_a}",
+        f"local {V_A}={stride}",
+        f"local {V_B}={seed_b}",
+        f"local {V_CA}={cipher_a}",
+        f"local {V_CB}={cipher_b}",
         f"local {V_OUT}={{}}",
-        f"local {V_SUM}=0x45D9",
-        f"local {V_EXPECT}={checksum}",
+        f"for {V_I}=1,{V_LEN}({V_ORDER}) do",
+        f"local {V_BLOCK}={V_PARTS}[{V_I}]",
+        f"local {V_POS}={V_ORDER}[{V_I}]",
+        f"{V_OUT}[{V_POS}]={V_BLOCK}",
+        "end",
+        f"local {V_DATA}={V_CONCAT}({V_OUT})",
+        f"local {V_TMP}=0xA5A5A5A5",
+        f"local {V_J}=0xC3C3C3C3",
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"{V_VALUE}=({V_VALUE}-{key}-(((({V_I}-1)/2)*31)%256))%256",
-        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
-        f"{V_SUM}=({V_SUM}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
+        f"{V_TMP}={V_TMP}~(({V_VALUE}+(({V_I}+1)/2)*17)%4294967296)",
+        f"{V_TMP}=({V_TMP}*0x01000193)%4294967296",
+        f"{V_TMP}=(({V_TMP}~math.floor({V_TMP}/8192))%4294967296)",
+        f"local {V_POS}=({V_LEN}({V_DATA})-{V_I})/2+1",
+        f"local {V_BLOCK}={V_TONUM}({V_SUB}({V_DATA},{V_I}*0+(({V_POS}-1)*2+1),(({V_POS}-1)*2+2)),16)",
+        f"{V_J}={V_J}~(({V_BLOCK}+{V_POS}*17)%4294967296)",
+        f"{V_J}=({V_J}*0x01000193)%4294967296",
+        f"{V_J}=(({V_J}~math.floor({V_J}/8192))%4294967296)",
         "end",
-        f"if {V_SUM}~={V_EXPECT} then",
-        "if warn then warn('[DEX] Anti-tamper check failed: protected payload was modified.') end",
-        "error('Protected payload integrity check failed')",
-        "end",
-        f"local {V_DEBUG}=debug",
-        f"if {V_TYPE}({V_DEBUG})=='table' and {V_TYPE}({V_DEBUG}.getinfo)=='function' then",
-        f"local {V_OK}={V_PCALL}({V_DEBUG}.getinfo,1,'f')",
-        f"if not {V_OK} and warn then warn('[DEX] Environment warning: debug API behaved unexpectedly.') end",
+        f"if {V_TMP}~={V_CA} or {V_J}~={V_CB} then error('Protected ciphertext integrity check failed') end",
+        f"local {V_OUT}={{}}",
+        f"local {V_PREV}={V_B}",
+        f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
+        f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
+        f"local {V_TMP}=({V_VALUE}-(((({V_I}-1)/2)*29+{V_B})%256))%256",
+        f"{V_TMP}={V_TMP}~{V_PREV}",
+        f"{V_TMP}=({V_TMP}-{V_T}-(((({V_I}-1)/2)*{V_A})%256))%256",
+        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}(({V_TMP}+256)%256)",
+        f"{V_PREV}={V_VALUE}",
         "end",
         f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
         f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
         f"if not {V_FN} then error('Internal Error: '..tostring({V_ERR})) end",
+        f"local {V_T}=0x811C9DC5",
+        f"local {V_J}=0x9E3779B9",
+        f"for {V_I}=1,{V_LEN}({V_SOURCE}) do",
+        f"local {V_VALUE}=string.byte({V_SOURCE},{V_I})",
+        f"{V_T}={V_T}~(({V_VALUE}+{V_I}*17)%4294967296)",
+        f"{V_T}=({V_T}*0x01000193)%4294967296",
+        f"{V_T}=(({V_T}~math.floor({V_T}/8192))%4294967296)",
+        f"local {V_POS}={V_LEN}({V_SOURCE})-{V_I}+1",
+        f"local {V_BLOCK}=string.byte({V_SOURCE},{V_POS})",
+        f"{V_J}={V_J}~(({V_BLOCK}+{V_POS}*17)%4294967296)",
+        f"{V_J}=({V_J}*0x01000193)%4294967296",
+        f"{V_J}=(({V_J}~math.floor({V_J}/8192))%4294967296)",
+        "end",
+        f"if {V_T}~={plain_a} or {V_J}~={plain_b} then error('Protected plaintext integrity check failed') end",
         f"return {V_FN}(...)",
         "end)(...)",
     ]
-
-    payload = lines[0] + "\n\n" + " ".join(x.strip() for x in lines[2:] if x.strip())
-
+    payload = lines[0] + "\n\n" + "\n".join(lines[2:])
+    payload = _line_scaled_padding(size_source, payload)
     if publish:
         _raw_backend_publish(payload)
-
     return payload
 
-
 def _pad_lua_payload_to_minimum(payload):
-    """Legacy compatibility helper; compact builds are never artificially padded."""
+    """Legacy compatibility helper."""
     return str(payload or "")
 
 
@@ -6236,10 +6314,11 @@ async def obfuscate_api(request: Request):
         # and executes the Goofyscator-protected original script.
         dex_obfuscated = await asyncio.to_thread(
             obfuscate_lua,
-            intermediate_source,  # tiny loadstring, not the full goofy payload
+            intermediate_source,  # executable payload remains the compact loader
             False,                 # publish=False — we publish it ourselves below
-            "hard",                # maximum cipher rounds / smallest block sizes
-            False,                 # minimum_size=False — no extra padding
+            "hard",                # strongest supported protection level
+            False,                 # minimum_size=False
+            source,                # size target is based on the ORIGINAL Lua source
         )
 
         if not dex_obfuscated or not dex_obfuscated.strip():
