@@ -5812,57 +5812,40 @@ def _build_loadstring(raw_url):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# AZUREVM ENCODER LAYER — Luraph-grade Binary Prototype Serializer
-# Transliterated from the Lua encoder (encoder.lua / AzureVM Encoder v14.7).
-# Applied as an additional hardening layer AFTER the DEX obfuscator.
-# Output is a self-contained Luau script that decodes and executes the payload.
+# DEX ENCODER LAYER — v15.2 Polymorphic Cipher Wrapper
+# Produces the canonical DEX 3-line output format:
+#   Line 1: "-- This file was protected using Dex Obfuscator v5.2 ..."
+#   Line 2: blank
+#   Line 3: return(function(...) <all code, single line> end)(...)
+# Executors parse it as one self-contained expression — no multi-line issues.
 # ═════════════════════════════════════════════════════════════════════════════
 
-class _AzureVMEncoder:
+class _DexEncoderV152:
     """
-    Python port of AzureVM Encoder v14.7.
+    Python port of the DEX v15.2 polymorphic cipher encoder.
 
-    Takes an arbitrary string (Lua/Luau source) and returns a
-    Luau-compatible self-decoding wrapper that applies:
-      • Multi-key rolling cipher   (azure_encrypt)
-      • Ascii85 + z-group encoding (base85_z_encode)
-      • Dynamic seed-based decoy header variables
+    Encryption pipeline:
+      • Multi-key rolling XOR cipher (dex_encrypt) — reversible, position-dependent
+      • Ascii85 + z-group encoding   (base85_z_encode) — compact, Luau long-string safe
+      • Obfuscated single-line Luau runtime decoder
+    Output is exactly 3 lines matching the DEX Obfuscator v5.2 format.
     """
 
-    DECOY_STRINGS = [
-        "game", "Workspace", "Players", "LocalPlayer", "Character", "Humanoid",
-        "HttpGet", "HttpPost", "syn", "request", "identifyexecutor",
-        "https://lura.ph/api/v2/loader", "LPH_VERIFIED_SIGNATURE_KEY",
-        "Invalid License Key Provided", "Tamper Detected! Terminating session...",
-        "loadstring", "setreadonly", "hookmetamethod", "hookfunction",
-        "getrawmetatable", "checkcaller", "islclosure", "getgenv", "rconsoleprint",
-        "LPH_JIT_MAX", "LPH_JIT_ULTRA", "LPH_OBFUSCATED", "LPH_NO_VIRTUALIZE",
-        "LPH_NO_UPVALUES", "LPH_CRASH", "LPH_HOOK_GUARD", "LPH_ENCKEY",
-        "_LPH_EXECUTE", "_LPH_WRAP", "_LPH_DECODE", "_LPH_PAYLOAD",
-        "https://lura.ph/api/v3/verify", "Luraph License Verified",
-        "debug.getinfo", "debug.sethook", "debug.traceback", "debug.getupvalue",
-        "coroutine.wrap", "pcall", "select", "setfenv", "getfenv",
-        "Integrity check failed", "Hook detected", "Protected by Luraph",
-        "Runtime signature mismatch", "LPH_SIGNATURE_VERIFIED",
-    ]
-
-    def __init__(self, seed: int | None = None):
-        import time as _time
-        self.seed = seed if seed is not None else int(_time.time())
-        rng = random.Random(self.seed)
-        self._rng = rng
-        # blob_key: 3..253
+    def __init__(self, seed=None):
+        self.seed = seed if seed is not None else int(time.time())
+        self._rng = random.Random(self.seed)
+        # blob_key in 3..253 derived from seed
         self.blob_key = (self.seed % 251) + 3
-        # str_key: 13..241
-        self.str_key = rng.randint(13, 241)
 
     # ------------------------------------------------------------------
-    # Internal cipher helpers (pure Python, match Lua implementation)
+    # Cipher
     # ------------------------------------------------------------------
-
     @staticmethod
-    def _azure_encrypt(data: bytes, key: int) -> bytes:
-        """Multi-key rolling cipher — 100% reversible."""
+    def _dex_encrypt(data: bytes, key: int) -> bytes:
+        """
+        DEX v15.2 multi-key rolling cipher.
+        k1/k2/k3 evolve each byte so static analysis can't recover the key.
+        """
         out = bytearray(len(data))
         k1 = key & 0xFF
         k2 = (key * 7 + 13) & 0xFF
@@ -5875,7 +5858,7 @@ class _AzureVMEncoder:
                 enc = (b - k2 + k3 - i) & 0xFF
             else:
                 enc = (b + k2 - k1 + i) & 0xFF
-            enc = enc & 0xFF
+            enc &= 0xFF
             out[i - 1] = enc
             k1 = (k1 * 13 + enc) & 0xFF
             k2 = (k2 * 31 + 17 + i) & 0xFF
@@ -5884,159 +5867,193 @@ class _AzureVMEncoder:
 
     @staticmethod
     def _base85_z_encode(data: bytes):
-        """Ascii85 with z-group compression. Returns (blob_str, pad_int)."""
+        """Ascii85 with z-group (all-zero group → 'z'). Returns (blob_str, pad)."""
         pad = (4 - (len(data) % 4)) % 4
         if pad:
             data = data + b"\x00" * pad
-        result = []
+        parts = []
         for i in range(0, len(data), 4):
             b1, b2, b3, b4 = data[i], data[i+1], data[i+2], data[i+3]
             val = b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
             if val == 0:
-                result.append("z")
+                parts.append("z")
             else:
                 chunk = []
                 for _ in range(5):
                     chunk.append(chr((val % 85) + 33))
                     val //= 85
-                result.append("".join(reversed(chunk)))
-        return "".join(result), pad
+                parts.append("".join(reversed(chunk)))
+        return "".join(parts), pad
 
-    def encode(self, source: str) -> tuple[str, int, int]:
-        """
-        Encode *source* (Lua/Luau text) through the AzureVM pipeline.
-
-        Returns:
-            (blob, pad, blob_key)
-              blob     — Ascii85 string ready for embedding in Luau
-              pad      — trailing padding byte count (0-3)
-              blob_key — int key for the runtime decoder
-        """
+    def encode(self, source: str):
+        """Encrypt + encode source. Returns (blob, pad, key)."""
         raw = source.encode("utf-8")
-        encrypted = self._azure_encrypt(raw, self.blob_key)
-        blob, pad = self._base85_z_encode(encrypted)
+        enc = self._dex_encrypt(raw, self.blob_key)
+        blob, pad = self._base85_z_encode(enc)
         return blob, pad, self.blob_key
 
-    def _decoy_vars(self, used_names: set) -> str:
-        """Emit ~30% of DECOY_STRINGS as dead Luau locals."""
-        lines = []
-        for ds in self.DECOY_STRINGS:
-            if self._rng.randint(1, 3) == 1:
-                vname = _junk_fenv_name(used_names)
-                escaped = ds.replace("\\", "\\\\").replace('"', '\\"')
-                lines.append(f'local {vname}="{escaped}"')
-        return "\n".join(lines)
 
-
-def _azure_vm_wrap(source: str) -> str:
+def _dex_encoder_wrap(source: str) -> str:
     """
-    Apply the AzureVM Encoder layer to *source* and return a Luau script
-    that decodes and executes it at runtime.
+    Wrap *source* through the DEX v15.2 encoder and return the canonical
+    3-line DEX output:
 
-    The emitted script is fully Luau-compatible (Roblox-safe):
-      • No removed globals (no setfenv/getfenv calls)
-      • Uses only: string, table, math, tonumber, string.char, pcall, error, warn
-      • Ascii85 decoder with z-group support
-      • Multi-key rolling cipher decode (matches _AzureVMEncoder._azure_encrypt)
+        -- This file was protected using Dex Obfuscator v5.2 ...
+        <blank>
+        return(function(...) <single-line Luau decoder> end)(...)
+
+    The inner decoder is fully Luau-compatible (Roblox-safe):
+      • No setfenv / getfenv — not available in Luau
+      • No global mutations
+      • Uses only: string, table, math, tonumber, pcall, error, loadstring/load
+      • Ascii85 z-group decoder + multi-key rolling cipher decrypt inline
+    All identifiers are run through the DEX obfuscated name generator.
     """
-    enc = _AzureVMEncoder()
+    enc = _DexEncoderV152()
     blob, pad, bkey = enc.encode(source)
 
     used: set = set()
     _reset_junk_fenv_counter()
     N = lambda: _unique_name(used)
 
-    # Runtime variable names (all obfuscated)
-    V_BLOB   = N(); V_PAD    = N(); V_KEY    = N()
-    V_K1     = N(); V_K2     = N(); V_K3     = N()
-    V_OUT    = N(); V_RAW    = N(); V_I      = N()
-    V_B      = N(); V_ENC    = N(); V_M      = N()
-    V_RESULT = N(); V_CHUNK  = N(); V_VAL    = N()
-    V_J      = N(); V_STR    = N(); V_DECODE = N()
-    V_LOAD   = N(); V_FN     = N(); V_ERR    = N()
-    V_OK     = N(); V_RES    = N(); V_FLOOR  = N()
-    V_CHAR   = N(); V_BYTE   = N(); V_LEN    = N()
-    V_CONCAT = N(); V_SUB    = N(); V_REV    = N()
-    V_TONUMB = N(); V_MATH   = N(); V_STRING = N()
-    V_TABLE  = N(); V_PCALL  = N(); V_ERROR  = N()
-    V_WARN   = N()
+    # ── Variable names ────────────────────────────────────────────────────────
+    # Stdlib refs
+    Vs  = N(); Vt  = N(); Vm  = N()   # string, table, math
+    Vpc = N(); Ver = N(); Vw  = N()   # pcall, error, warn
+    Vfl = N(); Vch = N()              # math.floor, string.char
+    Vln = N(); Vsb = N()              # string.len, string.sub
+    Vct = N(); Vtn = N(); Vld = N()   # table.concat, tonumber, loadstring
+    # Data
+    Vblob = N(); Vpad = N(); Vkey = N()
+    # Decode loop
+    Vi = N(); Vj = N(); Vout = N(); Vchk = N(); Vval = N(); Vbyt = N()
+    Volen = N()
+    # Cipher loop
+    Vraw = N(); Vk1 = N(); Vk2 = N(); Vk3 = N()
+    Vb = N(); Vmo = N(); Vdec = N()
+    # Exec
+    Vfn = N(); Vev = N(); Vok = N(); Vrs = N()
 
-    # Decoy dead-code locals to pad with decoy strings
-    decoy_block = enc._decoy_vars(used)
+    # ── Junk padding (do...end blocks, ~140 locals each, Luau-safe) ───────────
+    # Target: 1 KB per line of source (same rule as obfuscate_lua)
+    src_lines = max(1, len(source.splitlines()))
+    target_bytes = src_lines * 1024
 
-    # Embed blob — use long string to avoid escape issues
-    # Ascii85 chars are all printable ASCII 33–122 plus 'z', safe in [=[...]=]
-    blob_literal = f"[=[{blob}]=]"
+    # ── Build the single inner code line ─────────────────────────────────────
+    # All statements separated by spaces — no newlines inside the function body.
+    # Blob is embedded as a Lua long string [=[...]=] so no escaping needed.
+    blob_lit = f"[=[{blob}]=]"
 
-    luau = f"""\
--- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]
-local {V_STRING}=string local {V_TABLE}=table local {V_MATH}=math
-local {V_PCALL}=pcall local {V_ERROR}=error local {V_WARN}=warn
-local {V_FLOOR}={V_MATH}.floor local {V_CHAR}={V_STRING}.char
-local {V_LEN}={V_STRING}.len local {V_SUB}={V_STRING}.sub
-local {V_CONCAT}={V_TABLE}.concat local {V_TONUMB}=tonumber
-local {V_LOAD}=loadstring or load
-{decoy_block}
-local {V_BLOB}={blob_literal}
-local {V_PAD}={pad}
-local {V_KEY}={bkey}
--- Ascii85 / z-group decode -> raw bytes
-local {V_DECODE}=(function({V_STR},{V_PAD})
-  local {V_OUT}={{}}
-  local {V_I}=1
-  while {V_I}<={V_LEN}({V_STR}) do
-    local {V_CHUNK}={V_SUB}({V_STR},{V_I},{V_I})
-    if {V_CHUNK}=="z" then
-      {V_OUT}[#{V_OUT}+1]=0 {V_OUT}[#{V_OUT}+1]=0
-      {V_OUT}[#{V_OUT}+1]=0 {V_OUT}[#{V_OUT}+1]=0
-      {V_I}={V_I}+1
-    else
-      local {V_VAL}=0
-      for {V_J}=0,4 do
-        local {V_B}={V_TONUMB}({V_STRING}.byte({V_SUB}({V_STR},{V_I}+{V_J},{V_I}+{V_J})))
-        if not {V_B} then break end
-        {V_VAL}={V_VAL}*85+({V_B}-33)
-      end
-      {V_OUT}[#{V_OUT}+1]={V_FLOOR}({V_VAL}/16777216)%256
-      {V_OUT}[#{V_OUT}+1]={V_FLOOR}({V_VAL}/65536)%256
-      {V_OUT}[#{V_OUT}+1]={V_FLOOR}({V_VAL}/256)%256
-      {V_OUT}[#{V_OUT}+1]={V_VAL}%256
-      {V_I}={V_I}+5
-    end
-  end
-  local _olen=#{V_OUT}
-  for {V_J}=1,{V_PAD} do {V_OUT}[_olen-{V_PAD}+{V_J}]=nil end
-  return {V_OUT}
-end)({V_BLOB},{V_PAD})
--- Multi-key rolling cipher decrypt
-local {V_RAW}={{}}
-local {V_K1}={V_KEY}%256
-local {V_K2}=({V_KEY}*7+13)%256
-local {V_K3}=({V_KEY}*31+17)%256
-for {V_I}=1,#{V_DECODE} do
-  local {V_B}={V_DECODE}[{V_I}]
-  local {V_M}={V_I}%3
-  local {V_ENC}
-  if {V_M}==0 then
-    {V_ENC}=({V_B}-{V_K1}-{V_K3}-{V_I})%256
-  elseif {V_M}==1 then
-    {V_ENC}=({V_B}+{V_K2}-{V_K3}+{V_I})%256
-  else
-    {V_ENC}=({V_B}-{V_K2}+{V_K1}-{V_I})%256
-  end
-  {V_ENC}=({V_ENC}+256)%256
-  {V_RAW}[{V_I}]={V_CHAR}({V_ENC})
-  local {V_RESULT}={V_ENC}
-  {V_K1}=({V_K1}*13+{V_DECODE}[{V_I}])%256
-  {V_K2}=({V_K2}*31+17+{V_I})%256
-  {V_K3}=({V_K3}*29+{V_DECODE}[{V_I}]+7)%256
-end
-local {V_FN},{V_ERR}={V_LOAD}({V_CONCAT}({V_RAW}))
-if not {V_FN} then {V_ERROR}("[AVM] Decode error: "..tostring({V_ERR})) end
-local {V_OK},{V_RES}={V_PCALL}({V_FN})
-if not {V_OK} then {V_ERROR}("[AVM] Runtime error: "..tostring({V_RES})) end
-"""
-    return luau
+    # Decoder: Ascii85/z-group → byte array, then rolling-cipher decrypt → source
+    parts = []
+
+    # stdlib captures
+    parts.append(f"local {Vs}=string")
+    parts.append(f"local {Vt}=table")
+    parts.append(f"local {Vm}=math")
+    parts.append(f"local {Vpc}=pcall")
+    parts.append(f"local {Ver}=error")
+    parts.append(f"local {Vw}=warn")
+    parts.append(f"local {Vfl}={Vm}.floor")
+    parts.append(f"local {Vch}={Vs}.char")
+    parts.append(f"local {Vln}={Vs}.len")
+    parts.append(f"local {Vsb}={Vs}.sub")
+    parts.append(f"local {Vct}={Vt}.concat")
+    parts.append(f"local {Vtn}=tonumber")
+    parts.append(f"local {Vld}=loadstring or load")
+
+    # blob + params
+    parts.append(f"local {Vblob}={blob_lit}")
+    parts.append(f"local {Vpad}={pad}")
+    parts.append(f"local {Vkey}={bkey}")
+
+    # ── Ascii85 / z-group decode to byte table ────────────────────────────────
+    parts.append(f"local {Vout}={{}}")
+    parts.append(f"local {Vi}=1")
+    parts.append(f"while {Vi}<={Vln}({Vblob}) do")
+    parts.append(f"local {Vchk}={Vsb}({Vblob},{Vi},{Vi})")
+    parts.append(f"if {Vchk}=='z' then")
+    parts.append(f"{Vout}[#{Vout}+1]=0 {Vout}[#{Vout}+1]=0 {Vout}[#{Vout}+1]=0 {Vout}[#{Vout}+1]=0")
+    parts.append(f"{Vi}={Vi}+1")
+    parts.append(f"else")
+    parts.append(f"local {Vval}=0")
+    parts.append(f"for {Vj}=0,4 do")
+    parts.append(f"local {Vbyt}={Vtn}({Vs}.byte({Vsb}({Vblob},{Vi}+{Vj},{Vi}+{Vj})))")
+    parts.append(f"if not {Vbyt} then break end")
+    parts.append(f"{Vval}={Vval}*85+({Vbyt}-33)")
+    parts.append(f"end")
+    parts.append(f"{Vout}[#{Vout}+1]={Vfl}({Vval}/16777216)%256")
+    parts.append(f"{Vout}[#{Vout}+1]={Vfl}({Vval}/65536)%256")
+    parts.append(f"{Vout}[#{Vout}+1]={Vfl}({Vval}/256)%256")
+    parts.append(f"{Vout}[#{Vout}+1]={Vval}%256")
+    parts.append(f"{Vi}={Vi}+5")
+    parts.append(f"end")
+    parts.append(f"end")
+    # trim padding bytes
+    parts.append(f"local {Volen}=#{Vout}")
+    parts.append(f"for {Vj}=1,{Vpad} do {Vout}[{Volen}-{Vpad}+{Vj}]=nil end")
+
+    # ── Rolling cipher decrypt ────────────────────────────────────────────────
+    parts.append(f"local {Vraw}={{}}")
+    parts.append(f"local {Vk1}={Vkey}%256")
+    parts.append(f"local {Vk2}=({Vkey}*7+13)%256")
+    parts.append(f"local {Vk3}=({Vkey}*31+17)%256")
+    parts.append(f"for {Vi}=1,#{Vout} do")
+    parts.append(f"local {Vb}={Vout}[{Vi}]")
+    parts.append(f"local {Vmo}={Vi}%3")
+    parts.append(f"local {Vdec}")
+    parts.append(f"if {Vmo}==0 then {Vdec}=({Vb}-{Vk1}-{Vk3}-{Vi})%256")
+    parts.append(f"elseif {Vmo}==1 then {Vdec}=({Vb}+{Vk2}-{Vk3}+{Vi})%256")
+    parts.append(f"else {Vdec}=({Vb}-{Vk2}+{Vk1}-{Vi})%256 end")
+    parts.append(f"{Vdec}=({Vdec}+256)%256")
+    parts.append(f"{Vraw}[{Vi}]={Vch}({Vdec})")
+    parts.append(f"local _e={Vout}[{Vi}]")
+    parts.append(f"{Vk1}=({Vk1}*13+_e)%256")
+    parts.append(f"{Vk2}=({Vk2}*31+17+{Vi})%256")
+    parts.append(f"{Vk3}=({Vk3}*29+_e+7)%256")
+    parts.append(f"end")
+
+    # ── Load + execute ────────────────────────────────────────────────────────
+    parts.append(f"local {Vfn},{Vev}={Vld}({Vct}({Vraw}))")
+    parts.append(f"if not {Vfn} then {Ver}('[DEX] Decode error: '..tostring({Vev})) end")
+    parts.append(f"local {Vok},{Vrs}={Vpc}({Vfn},...)")
+    parts.append(f"if not {Vok} then {Ver}('[DEX] Runtime error: '..tostring({Vrs})) end")
+    parts.append(f"return {Vrs}")
+
+    inner = " ".join(parts)
+
+    # ── Junk padding (do...end blocks inserted before the inner code) ─────────
+    # Same strategy as obfuscate_lua Layer 11: 140 locals per do-block, each
+    # block gets its own scope so we never hit Luau's 200 local limit.
+    REAL_LOCALS   = len([p for p in parts if p.startswith("local ")]) + 4  # safety
+    LOCALS_BLOCK  = min(140, 200 - REAL_LOCALS - 10)
+    if LOCALS_BLOCK < 10:
+        LOCALS_BLOCK = 10
+
+    current_bytes = len(inner.encode("utf-8")) + 80  # +80 for header/wrapper
+    deficit = target_bytes - current_bytes
+    junk_blocks = []
+    pad_bytes = 0
+    while pad_bytes < deficit:
+        frags = []
+        for _ in range(LOCALS_BLOCK):
+            n = _junk_fenv_name(used)
+            frags.append(f"local {n}=({_RNG.randint(1,0xFFFF)}*{_RNG.randint(1,0xFFFF)})%{_RNG.randint(1,0xFFFF)+1}")
+        block = "do " + " ".join(frags) + " end"
+        junk_blocks.append(block)
+        pad_bytes += len(block) + 1
+        if pad_bytes >= deficit:
+            break
+
+    junk_str = " ".join(junk_blocks)
+    if junk_str:
+        inner = junk_str + " " + inner
+
+    # ── Assemble 3-line output ────────────────────────────────────────────────
+    header = "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]"
+    code_line = f"return(function(...) {inner} end)(...)"
+
+    return header + "\n\n" + code_line
 
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, target_bytes: int = 0) -> str:
@@ -6786,20 +6803,20 @@ async def obfuscate_api(request: Request):
         if not dex_obfuscated or not dex_obfuscated.strip():
             raise RuntimeError("DEX obfuscator returned an empty payload.")
 
-        # ── Step 5.5: AzureVM Encoder layer ─────────────────────────────────
-        # Wrap the DEX-obfuscated Lua blob through the AzureVM Encoder.
-        # This adds a Luraph-grade binary serializer + multi-key rolling cipher
-        # + Ascii85/z-group encoding layer on top of the DEX cipher, making the
-        # output significantly harder to reverse statically.
+        # ── Step 5.5: DEX v15.2 Encoder layer ───────────────────────────────
+        # Wrap the DEX-obfuscated Lua blob through the DEX v15.2 polymorphic
+        # cipher encoder. Output is exactly 3 lines: header comment, blank,
+        # single-line return(function(...)...end)(...) payload.
+        # Adds Ascii85/z-group + multi-key rolling cipher on top of the DEX
+        # XOR layer for double-layer protection with correct Luau syntax.
         try:
-            dex_obfuscated = await asyncio.to_thread(_azure_vm_wrap, dex_obfuscated)
-        except Exception as avm_exc:
-            print(f"[AZURE_VM_ENCODER] failed (continuing without AVM layer): {avm_exc}")
+            dex_obfuscated = await asyncio.to_thread(_dex_encoder_wrap, dex_obfuscated)
+        except Exception as enc_exc:
+            print(f"[DEX_ENCODER_V152] failed (continuing without encoder layer): {enc_exc}")
             # Non-fatal — fall back to plain DEX output if the encoder errors.
 
-        # ── Step 6: Publish AzureVM-wrapped DEX payload to the raw store ────
-        # This is the URL that end-users actually copy.  It points to the
-        # AzureVM-wrapped DEX blob instead of the plain DEX output.
+        # ── Step 6: Publish DEX-encoded payload to the raw store ─────────────
+        # This is the URL that end-users actually copy.
         try:
             raw_url, loader_id = _publish_local_payload(dex_obfuscated)
         except Exception as pub_exc:
