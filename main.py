@@ -5811,254 +5811,6 @@ def _build_loadstring(raw_url):
     return "loadstring(game:HttpGet(" + json.dumps(raw_url) + "))()"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# DEX ENCODER LAYER — v15.2 Polymorphic Cipher Wrapper
-# Produces the canonical DEX 3-line output format:
-#   Line 1: "-- This file was protected using Dex Obfuscator v5.2 ..."
-#   Line 2: blank
-#   Line 3: return(function(...) <all code, single line> end)(...)
-# Executors parse it as one self-contained expression — no multi-line issues.
-# ═════════════════════════════════════════════════════════════════════════════
-
-class _DexEncoderV152:
-    """
-    Python port of the DEX v15.2 polymorphic cipher encoder.
-
-    Encryption pipeline:
-      • Multi-key rolling XOR cipher (dex_encrypt) — reversible, position-dependent
-      • Ascii85 + z-group encoding   (base85_z_encode) — compact, Luau long-string safe
-      • Obfuscated single-line Luau runtime decoder
-    Output is exactly 3 lines matching the DEX Obfuscator v5.2 format.
-    """
-
-    def __init__(self, seed=None):
-        self.seed = seed if seed is not None else int(time.time())
-        self._rng = random.Random(self.seed)
-        # blob_key in 3..253 derived from seed
-        self.blob_key = (self.seed % 251) + 3
-
-    # ------------------------------------------------------------------
-    # Cipher
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _dex_encrypt(data: bytes, key: int) -> bytes:
-        """
-        DEX v15.2 multi-key rolling cipher.
-        k1/k2/k3 evolve each byte so static analysis can't recover the key.
-        """
-        out = bytearray(len(data))
-        k1 = key & 0xFF
-        k2 = (key * 7 + 13) & 0xFF
-        k3 = (key * 31 + 17) & 0xFF
-        for i, b in enumerate(data, 1):
-            m = i % 3
-            if m == 0:
-                enc = (b + k1 + k3 + i) & 0xFF
-            elif m == 1:
-                enc = (b - k2 + k3 - i) & 0xFF
-            else:
-                enc = (b + k2 - k1 + i) & 0xFF
-            enc &= 0xFF
-            out[i - 1] = enc
-            k1 = (k1 * 13 + enc) & 0xFF
-            k2 = (k2 * 31 + 17 + i) & 0xFF
-            k3 = (k3 * 29 + enc + 7) & 0xFF
-        return bytes(out)
-
-    @staticmethod
-    def _base85_z_encode(data: bytes):
-        """Ascii85 with z-group (all-zero group → 'z'). Returns (blob_str, pad)."""
-        pad = (4 - (len(data) % 4)) % 4
-        if pad:
-            data = data + b"\x00" * pad
-        parts = []
-        for i in range(0, len(data), 4):
-            b1, b2, b3, b4 = data[i], data[i+1], data[i+2], data[i+3]
-            val = b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
-            if val == 0:
-                parts.append("z")
-            else:
-                chunk = []
-                for _ in range(5):
-                    chunk.append(chr((val % 85) + 33))
-                    val //= 85
-                parts.append("".join(reversed(chunk)))
-        return "".join(parts), pad
-
-    def encode(self, source: str):
-        """Encrypt + encode source. Returns (blob, pad, key)."""
-        raw = source.encode("utf-8")
-        enc = self._dex_encrypt(raw, self.blob_key)
-        blob, pad = self._base85_z_encode(enc)
-        return blob, pad, self.blob_key
-
-
-def _dex_encoder_wrap(source: str) -> str:
-    """
-    Wrap *source* through the DEX v15.2 encoder and return the canonical
-    3-line DEX output:
-
-        -- This file was protected using Dex Obfuscator v5.2 ...
-        <blank>
-        return(function(...) <single-line Luau decoder> end)(...)
-
-    The inner decoder is fully Luau-compatible (Roblox-safe):
-      • No setfenv / getfenv — not available in Luau
-      • No global mutations
-      • Uses only: string, table, math, tonumber, pcall, error, loadstring/load
-      • Ascii85 z-group decoder + multi-key rolling cipher decrypt inline
-    All identifiers are run through the DEX obfuscated name generator.
-    """
-    enc = _DexEncoderV152()
-    blob, pad, bkey = enc.encode(source)
-
-    used: set = set()
-    _reset_junk_fenv_counter()
-    N = lambda: _unique_name(used)
-
-    # ── Variable names ────────────────────────────────────────────────────────
-    # Stdlib refs
-    Vs  = N(); Vt  = N(); Vm  = N()   # string, table, math
-    Vpc = N(); Ver = N(); Vw  = N()   # pcall, error, warn
-    Vfl = N(); Vch = N()              # math.floor, string.char
-    Vln = N(); Vsb = N()              # string.len, string.sub
-    Vct = N(); Vtn = N(); Vld = N()   # table.concat, tonumber, loadstring
-    # Data
-    Vblob = N(); Vpad = N(); Vkey = N()
-    # Decode loop
-    Vi = N(); Vj = N(); Vout = N(); Vchk = N(); Vval = N(); Vbyt = N()
-    Volen = N()
-    # Cipher loop
-    Vraw = N(); Vk1 = N(); Vk2 = N(); Vk3 = N()
-    Vb = N(); Vmo = N(); Vdec = N()
-    # Exec
-    Vfn = N(); Vev = N(); Vok = N(); Vrs = N()
-
-    # ── Junk padding (do...end blocks, ~140 locals each, Luau-safe) ───────────
-    # Target: 1 KB per line of source (same rule as obfuscate_lua)
-    src_lines = max(1, len(source.splitlines()))
-    target_bytes = src_lines * 1024
-
-    # ── Build the single inner code line ─────────────────────────────────────
-    # All statements separated by spaces — no newlines inside the function body.
-    # Blob is embedded as a Lua long string [=[...]=] so no escaping needed.
-    blob_lit = f"[=[{blob}]=]"
-
-    # Decoder: Ascii85/z-group → byte array, then rolling-cipher decrypt → source
-    parts = []
-
-    # stdlib captures
-    parts.append(f"local {Vs}=string")
-    parts.append(f"local {Vt}=table")
-    parts.append(f"local {Vm}=math")
-    parts.append(f"local {Vpc}=pcall")
-    parts.append(f"local {Ver}=error")
-    parts.append(f"local {Vw}=warn")
-    parts.append(f"local {Vfl}={Vm}.floor")
-    parts.append(f"local {Vch}={Vs}.char")
-    parts.append(f"local {Vln}={Vs}.len")
-    parts.append(f"local {Vsb}={Vs}.sub")
-    parts.append(f"local {Vct}={Vt}.concat")
-    parts.append(f"local {Vtn}=tonumber")
-    parts.append(f"local {Vld}=loadstring or load")
-
-    # blob + params
-    parts.append(f"local {Vblob}={blob_lit}")
-    parts.append(f"local {Vpad}={pad}")
-    parts.append(f"local {Vkey}={bkey}")
-
-    # ── Ascii85 / z-group decode to byte table ────────────────────────────────
-    parts.append(f"local {Vout}={{}}")
-    parts.append(f"local {Vi}=1")
-    parts.append(f"while {Vi}<={Vln}({Vblob}) do")
-    parts.append(f"local {Vchk}={Vsb}({Vblob},{Vi},{Vi})")
-    parts.append(f"if {Vchk}=='z' then")
-    parts.append(f"{Vout}[#{Vout}+1]=0 {Vout}[#{Vout}+1]=0 {Vout}[#{Vout}+1]=0 {Vout}[#{Vout}+1]=0")
-    parts.append(f"{Vi}={Vi}+1")
-    parts.append(f"else")
-    parts.append(f"local {Vval}=0")
-    parts.append(f"for {Vj}=0,4 do")
-    parts.append(f"local {Vbyt}={Vtn}({Vs}.byte({Vsb}({Vblob},{Vi}+{Vj},{Vi}+{Vj})))")
-    parts.append(f"if not {Vbyt} then break end")
-    parts.append(f"{Vval}={Vval}*85+({Vbyt}-33)")
-    parts.append(f"end")
-    parts.append(f"{Vout}[#{Vout}+1]={Vfl}({Vval}/16777216)%256")
-    parts.append(f"{Vout}[#{Vout}+1]={Vfl}({Vval}/65536)%256")
-    parts.append(f"{Vout}[#{Vout}+1]={Vfl}({Vval}/256)%256")
-    parts.append(f"{Vout}[#{Vout}+1]={Vval}%256")
-    parts.append(f"{Vi}={Vi}+5")
-    parts.append(f"end")
-    parts.append(f"end")
-    # trim padding bytes
-    parts.append(f"local {Volen}=#{Vout}")
-    parts.append(f"for {Vj}=1,{Vpad} do {Vout}[{Volen}-{Vpad}+{Vj}]=nil end")
-
-    # ── Rolling cipher decrypt ────────────────────────────────────────────────
-    parts.append(f"local {Vraw}={{}}")
-    parts.append(f"local {Vk1}={Vkey}%256")
-    parts.append(f"local {Vk2}=({Vkey}*7+13)%256")
-    parts.append(f"local {Vk3}=({Vkey}*31+17)%256")
-    parts.append(f"for {Vi}=1,#{Vout} do")
-    parts.append(f"local {Vb}={Vout}[{Vi}]")
-    parts.append(f"local {Vmo}={Vi}%3")
-    parts.append(f"local {Vdec}")
-    parts.append(f"if {Vmo}==0 then {Vdec}=({Vb}-{Vk1}-{Vk3}-{Vi})%256")
-    parts.append(f"elseif {Vmo}==1 then {Vdec}=({Vb}+{Vk2}-{Vk3}+{Vi})%256")
-    parts.append(f"else {Vdec}=({Vb}-{Vk2}+{Vk1}-{Vi})%256 end")
-    parts.append(f"{Vdec}=({Vdec}+256)%256")
-    parts.append(f"{Vraw}[{Vi}]={Vch}({Vdec})")
-    parts.append(f"local _e={Vout}[{Vi}]")
-    parts.append(f"{Vk1}=({Vk1}*13+_e)%256")
-    parts.append(f"{Vk2}=({Vk2}*31+17+{Vi})%256")
-    parts.append(f"{Vk3}=({Vk3}*29+_e+7)%256")
-    parts.append(f"end")
-
-    # ── Load + execute ────────────────────────────────────────────────────────
-    parts.append(f"local {Vfn},{Vev}={Vld}({Vct}({Vraw}))")
-    parts.append(f"if not {Vfn} then {Ver}('[DEX] Decode error: '..tostring({Vev})) end")
-    parts.append(f"local {Vok},{Vrs}={Vpc}({Vfn},...)")
-    parts.append(f"if not {Vok} then {Ver}('[DEX] Runtime error: '..tostring({Vrs})) end")
-    parts.append(f"return {Vrs}")
-
-    inner = "\n".join(parts)
-
-    # ── Junk padding (do...end blocks inserted before the inner code) ─────────
-    # Same strategy as obfuscate_lua Layer 11: 140 locals per do-block, each
-    # block gets its own scope so we never hit Luau's 200 local limit.
-    REAL_LOCALS   = len([p for p in parts if p.startswith("local ")]) + 4  # safety
-    LOCALS_BLOCK  = min(140, 200 - REAL_LOCALS - 10)
-    if LOCALS_BLOCK < 10:
-        LOCALS_BLOCK = 10
-
-    current_bytes = len(inner.encode("utf-8")) + 80  # +80 for header/wrapper
-    deficit = target_bytes - current_bytes
-    junk_blocks = []
-    pad_bytes = 0
-    while pad_bytes < deficit:
-        frags = []
-        for _ in range(LOCALS_BLOCK):
-            n = _junk_fenv_name(used)
-            frags.append(f"local {n}=({_RNG.randint(1,0xFFFF)}*{_RNG.randint(1,0xFFFF)})%{_RNG.randint(1,0xFFFF)+1}")
-        block = "do\n" + "\n".join(frags) + "\nend"
-        junk_blocks.append(block)
-        pad_bytes += len(block) + 1
-        if pad_bytes >= deficit:
-            break
-
-    junk_str = "\n".join(junk_blocks)
-    if junk_str:
-        inner = junk_str + "\n" + inner
-
-    # ── Assemble 3-line output ────────────────────────────────────────────────
-    # Keep the return(...) wrapper on a single line so linters (e.g. Nexomia)
-    # don't flag line 3 as an incomplete statement.
-    header = "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]"
-    inner_single = inner.replace("\n", " ")
-    code_line = "return(function(...) " + inner_single + " end)(...)"
-
-    return header + "\n\n" + code_line
-
-
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, target_bytes: int = 0) -> str:
     """
     Hardened Lua protection wrapper for Roblox/Luau environments.
@@ -6145,7 +5897,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     # Decoder helpers
     V_CHAR   = N(); V_LEN    = N(); V_SUB    = N()
     V_CONCAT = N(); V_TONUM  = N(); V_LOAD   = N()
-    V_FLOOR  = N(); V_BIT32  = N()
+    V_FLOOR  = N()
 
     # Layer 4 — split key
     V_KEY_A  = N(); V_KEY_B  = N(); V_KEY    = N()
@@ -6166,7 +5918,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     V_SOURCE = N(); V_FN     = N(); V_ERR    = N()
     V_OK     = N(); V_RESULT = N()
 
-    # Total outer-function locals above: 49 — well under 200 limit.
+    # Total outer-function locals above: 48 — well under 200 limit.
 
     lines = [
         "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
@@ -6231,7 +5983,6 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_TONUM}=tonumber",
         f"local {V_LOAD}=loadstring or load",
         f"local {V_FLOOR}={V_MATH}.floor",
-        f"local {V_BIT32}=bit32",
         f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
         f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: decoder functions unavailable') end",
         f"{V_ERROR}('[DEX] Unsupported runtime')",
@@ -6240,7 +5991,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # ── Layer 4: reconstruct XOR key from split halves ────────────────────
         f"local {V_KEY_A}={key_a}",
         f"local {V_KEY_B}={key_b}",
-        f"local {V_KEY}={V_BIT32}.bxor({V_KEY_A},{V_KEY_B})",  # Luau-compatible XOR via bit32.bxor
+        f"local {V_KEY}={V_KEY_A}~{V_KEY_B}",  # Lua bitwise XOR (Luau supports ~)
 
         # ── Layer 5: reconstruct payload from split halves ────────────────────
         f"local {V_HALF_A}='{encoded_a}'",
@@ -6267,8 +6018,8 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"if {V_WARN} then {V_WARN}('[DEX] Payload encoding check failed') end",
         f"{V_ERROR}('[DEX] Payload encoding check failed')",
         "end",
-        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+({V_I}+1)//2)%4294967296",
-        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+(({V_I}+1)//2)*29)%4294967296",
+        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
+        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*29)%4294967296",
         "end",
         f"if {V_CSUM_A}~={V_CEXPECT_A} or {V_CSUM_B}~={V_CEXPECT_B} then",
         f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: ciphertext modified') end",
@@ -6286,11 +6037,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
         # decrypt: subtract key and position-dependent offset
-        f"{V_VALUE}=({V_VALUE}-{V_KEY}-(({V_I}-1)//2*31%256))%256",
-        f"{V_OUT}[({V_I}+1)//2]={V_CHAR}({V_VALUE})",
-        f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+({V_I}+1)//2)%4294967296",
-        f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+(({V_I}+1)//2)*17)%4294967296",
-        f"{V_SUM_C}=({V_BIT32}.bxor({V_SUM_C},{V_VALUE})*16777619)%4294967296",
+        f"{V_VALUE}=({V_VALUE}-{V_KEY}-({V_FLOOR}(({V_I}-1)/2)*31%256))%256",
+        f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
+        f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
+        f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
+        f"{V_SUM_C}=(({V_SUM_C}~{V_VALUE})*16777619)%4294967296",
         "end",
 
         # ── Layer 7+8+9 verification ──────────────────────────────────────────
@@ -6318,7 +6069,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     # ── Assemble the 3-line output ─────────────────────────────────────────────
     comment_line = lines[0]
-    code_line    = "\n".join(x.strip() for x in lines[2:] if x.strip())
+    code_line    = " ".join(x.strip() for x in lines[2:] if x.strip())
 
     # Size-scaling: 1 KB per source line.
     if target_bytes and target_bytes > 0:
@@ -6332,11 +6083,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     current_code_bytes = len(code_line.encode("utf-8"))
     if current_code_bytes < needed_code:
         # ── Layer 11: padding in do...end blocks (160 locals each, Luau-safe) ─
-        # Outer fn now uses 49 real locals. Each do-block gets its own scope.
-        # 200 - 49 - 12(margin) = 139 per block — safely under the 200 limit.
-        REAL_LOCALS      = 49
+        # Outer fn now uses 48 real locals. Each do-block gets its own scope.
+        # 200 - 48 - 12(margin) = 140 per block — safely under the 200 limit.
+        REAL_LOCALS      = 48
         SAFETY_MARGIN    = 12
-        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 139
+        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 140
 
         INSERT_MARKER = "return(function(...)"
         splice_idx    = code_line.find(INSERT_MARKER)
@@ -6352,18 +6103,18 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
                 n    = _junk_fenv_name(used)
                 frag = f"local {n}=({_RNG.randint(1,0xFFFF)}*{_RNG.randint(1,0xFFFF)})%{_RNG.randint(1,0xFFFF)+1}"
                 frags.append(frag)
-            block = "do\n" + "\n".join(frags) + "\nend"
+            block = "do " + " ".join(frags) + " end"
             blocks.append(block)
             pad_bytes += len(block) + 1
             if pad_bytes >= deficit:
                 break
 
-        pad_str  = "\n".join(blocks)
+        pad_str  = " ".join(blocks)
         code_line = (
             code_line[:splice_pos]
-            + "\n"
+            + " "
             + pad_str
-            + "\n"
+            + " "
             + code_line[splice_pos:]
         )
 
@@ -6807,20 +6558,9 @@ async def obfuscate_api(request: Request):
         if not dex_obfuscated or not dex_obfuscated.strip():
             raise RuntimeError("DEX obfuscator returned an empty payload.")
 
-        # ── Step 5.5: DEX v15.2 Encoder layer ───────────────────────────────
-        # Wrap the DEX-obfuscated Lua blob through the DEX v15.2 polymorphic
-        # cipher encoder. Output is exactly 3 lines: header comment, blank,
-        # single-line return(function(...)...end)(...) payload.
-        # Adds Ascii85/z-group + multi-key rolling cipher on top of the DEX
-        # XOR layer for double-layer protection with correct Luau syntax.
-        try:
-            dex_obfuscated = await asyncio.to_thread(_dex_encoder_wrap, dex_obfuscated)
-        except Exception as enc_exc:
-            print(f"[DEX_ENCODER_V152] failed (continuing without encoder layer): {enc_exc}")
-            # Non-fatal — fall back to plain DEX output if the encoder errors.
-
-        # ── Step 6: Publish DEX-encoded payload to the raw store ─────────────
-        # This is the URL that end-users actually copy.
+        # ── Step 6: Publish DEX-obfuscated wrapper to the raw store ─────────
+        # This is the URL that end-users actually copy.  It points to a tiny
+        # DEX blob (~2–4 KB) instead of the full goofyscated script.
         try:
             raw_url, loader_id = _publish_local_payload(dex_obfuscated)
         except Exception as pub_exc:
