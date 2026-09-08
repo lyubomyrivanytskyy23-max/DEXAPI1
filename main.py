@@ -5727,16 +5727,13 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     """
     Compact compatibility-oriented Lua protection wrapper.
 
-    Strengthened outer layer (v6.1):
-      - Three-key, position-dependent XOR cipher (key1 XOR key2*pos XOR key3*(pos^2))
-      - Four independent plaintext checksums (djb2a, sdbm, fnv1a-32, polynomial)
-      - Four independent ciphertext checksums mirroring the above
-      - Encoded payload split into random-sized string fragments reassembled at runtime
-      - Dead-code noise blocks that evaluate correctly but resist static analysis
-      - Opaque boolean sentinels wrapping every integrity branch
-      - Runtime environment probes: type, math, rawget, select, string, table
-      - Protected decoder constants captured into locals before any logic runs
-      - Dual xpcall/pcall execution path with detailed failure messages
+    Strengthened outer layer:
+      - encrypted payload length validation
+      - independent plaintext checksum
+      - independent ciphertext checksum
+      - structural/runtime capability checks
+      - protected decoder constants captured locally
+      - protected execution through pcall with useful failure messages
 
     This deliberately avoids executor-specific detection or anti-analysis tricks:
     client-side Lua can still be inspected by the environment executing it.
@@ -5752,135 +5749,77 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     normalize_obf_level(level)
 
     src = source.encode("utf-8")
+    key = _RNG.randint(1, 255)
 
-    # ── Three-key position-dependent cipher ──────────────────────────────────
-    # Each byte is XOR'd with three overlapping key streams so that single-byte
-    # frequency analysis and simple subtract-the-key attacks both fail.
-    key1 = _RNG.randint(1, 255)
-    key2 = _RNG.randint(1, 255)
-    key3 = _RNG.randint(1, 255)
+    # Compact reversible byte stream.
+    encrypted = bytes(
+        (value + key + ((index * 31) & 0xFF)) & 0xFF
+        for index, value in enumerate(src)
+    )
 
-    encrypted = bytearray(len(src))
-    for i, b in enumerate(src):
-        k = (key1 ^ ((key2 * (i + 1)) & 0xFF) ^ ((key3 * (((i + 1) * (i + 1)) & 0xFF)) & 0xFF)) & 0xFF
-        encrypted[i] = (b ^ k) & 0xFF
-    encrypted = bytes(encrypted)
+    # Two independent integrity values make accidental/casual modification
+    # substantially easier to detect than relying on one accumulator.
+    checksum_a = 0x45D9
+    checksum_b = 0xA7C3
+    for index, value in enumerate(src, 1):
+        checksum_a = (checksum_a * 33 + value + index) & 0xFFFFFFFF
+        checksum_b = (checksum_b * 65599 + value + (index * 17)) & 0xFFFFFFFF
 
-    # ── Four independent plaintext checksums ─────────────────────────────────
-    # djb2a, sdbm, fnv1a-32, and a custom polynomial — four different prime
-    # bases so a single arithmetic error cannot satisfy more than one.
-    pt_djb2a  = 0x45D9
-    pt_sdbm   = 0xA7C3
-    pt_fnv1a  = 0x811C9DC5
-    pt_poly   = 0x1B3F
-    for idx, b in enumerate(src, 1):
-        pt_djb2a  = (pt_djb2a  * 33  ^ b + idx)              & 0xFFFFFFFF
-        pt_sdbm   = (pt_sdbm   * 65599 + b + (idx * 17))     & 0xFFFFFFFF
-        pt_fnv1a  = ((pt_fnv1a ^ b) * 0x01000193 + idx * 7)  & 0xFFFFFFFF
-        pt_poly   = (pt_poly   * 257 + b * 13 + idx * 31)    & 0xFFFFFFFF
+    cipher_a = 0x6D31
+    cipher_b = 0x91E7
+    for index, value in enumerate(encrypted, 1):
+        cipher_a = (cipher_a * 33 + value + index) & 0xFFFFFFFF
+        cipher_b = (cipher_b * 65599 + value + (index * 29)) & 0xFFFFFFFF
 
-    # ── Four independent ciphertext checksums ────────────────────────────────
-    ct_djb2a  = 0x6D31
-    ct_sdbm   = 0x91E7
-    ct_fnv1a  = 0x84222325
-    ct_poly   = 0x2A5C
-    for idx, b in enumerate(encrypted, 1):
-        ct_djb2a  = (ct_djb2a  * 33  ^ b + idx)              & 0xFFFFFFFF
-        ct_sdbm   = (ct_sdbm   * 65599 + b + (idx * 29))     & 0xFFFFFFFF
-        ct_fnv1a  = ((ct_fnv1a ^ b) * 0x01000193 + idx * 11) & 0xFFFFFFFF
-        ct_poly   = (ct_poly   * 257 + b * 19 + idx * 43)    & 0xFFFFFFFF
+    source_length = len(src)
+    encoded = encrypted.hex()
+    encoded_length = len(encoded)
 
-    source_length   = len(src)
-    encoded_full    = encrypted.hex()
-    encoded_length  = len(encoded_full)
-
-    # ── Fragment the hex string into random-sized chunks ─────────────────────
-    # The Lua runtime will concatenate them before parsing, making it much
-    # harder to extract and replay the raw payload from a static dump.
-    fragment_pieces = []
-    cursor = 0
-    while cursor < len(encoded_full):
-        # Each chunk covers a whole number of bytes (multiple of 2 hex chars).
-        chunk_bytes = _RNG.randint(8, 48)
-        chunk_hex   = chunk_bytes * 2
-        piece = encoded_full[cursor: cursor + chunk_hex]
-        if piece:
-            fragment_pieces.append(piece)
-        cursor += chunk_hex
-
-    # ── Noise helper ─────────────────────────────────────────────────────────
-    def _noise_stmt(vname):
-        """Return a Lua statement that computes a random integer into vname,
-        guaranteed to evaluate correctly but impossible to constant-fold by
-        a naive static analyser."""
-        ops = [
-            lambda: f"local {vname}=(({_RNG.randint(100,9000)}*{_RNG.randint(2,9)})//{_RNG.randint(2,9)})",
-            lambda: f"local {vname}=(({_RNG.randint(10000,99999)}-{_RNG.randint(1,5000)})+{_RNG.randint(1,100)})",
-            lambda: f"local {vname}=({_RNG.randint(1,255)}~{_RNG.randint(1,255)})+{_RNG.randint(0,7)}",
-        ]
-        return _RNG.choice(ops)()
-
-    # ── Name allocator ────────────────────────────────────────────────────────
     used = set()
     N = lambda: _unique_name(used)
 
-    # Runtime globals
-    V_TYPE      = N(); V_PCALL    = N(); V_XPCALL   = N()
-    V_TOSTRING  = N(); V_ERROR    = N(); V_WARN      = N()
-    V_STRING    = N(); V_TABLE    = N(); V_MATH      = N()
-    V_RAWGET    = N(); V_SELECT   = N()
+    V_TYPE = N()
+    V_PCALL = N()
+    V_XPCALL = N()
+    V_TOSTRING = N()
+    V_ERROR = N()
+    V_WARN = N()
 
-    # String/table helpers
-    V_CHAR      = N(); V_LEN      = N(); V_SUB       = N()
-    V_CONCAT    = N(); V_TONUM    = N()
+    V_STRING = N()
+    V_TABLE = N()
+    V_CHAR = N()
+    V_LEN = N()
+    V_SUB = N()
+    V_CONCAT = N()
+    V_TONUM = N()
 
-    # Loader, data, scratch
-    V_LOAD      = N(); V_OUT      = N(); V_VALUE     = N(); V_I = N()
+    V_LOAD = N()
+    V_DATA = N()
+    V_OUT = N()
+    V_VALUE = N()
+    V_I = N()
 
-    # Fragment variables (one per piece)
-    V_FRAGS     = [N() for _ in fragment_pieces]
-    V_DATA      = N()  # assembled string
+    V_SUM_A = N()
+    V_SUM_B = N()
+    V_EXPECT_A = N()
+    V_EXPECT_B = N()
+    V_CSUM_A = N()
+    V_CSUM_B = N()
+    V_CEXPECT_A = N()
+    V_CEXPECT_B = N()
 
-    # Structural constants
-    V_EXPECT_LEN     = N(); V_EXPECT_HEX_LEN = N()
-
-    # Ciphertext checksum accumulators + expectations
-    V_CSUM_DJB2A  = N(); V_CSUM_SDBM   = N()
-    V_CSUM_FNV1A  = N(); V_CSUM_POLY   = N()
-    V_CEXP_DJB2A  = N(); V_CEXP_SDBM   = N()
-    V_CEXP_FNV1A  = N(); V_CEXP_POLY   = N()
-
-    # Plaintext checksum accumulators + expectations
-    V_SUM_DJB2A   = N(); V_SUM_SDBM    = N()
-    V_SUM_FNV1A   = N(); V_SUM_POLY    = N()
-    V_EXP_DJB2A   = N(); V_EXP_SDBM    = N()
-    V_EXP_FNV1A   = N(); V_EXP_POLY    = N()
-
-    # Opaque sentinel and execution helpers
-    V_SENTINEL  = N(); V_SOURCE    = N()
-    V_FN        = N(); V_ERR       = N()
-    V_OK        = N(); V_RESULT    = N()
-
-    # Noise variable names (4 random dead-code blobs)
-    V_NOISE     = [N() for _ in range(4)]
-
-    # ── key expressions ───────────────────────────────────────────────────────
-    # Emit the three cipher keys as opaque number expressions so they don't
-    # appear as plain integer literals in the output.
-    E_KEY1 = _num_expr(key1)
-    E_KEY2 = _num_expr(key2)
-    E_KEY3 = _num_expr(key3)
-
-    # Opaque true sentinel: (x~x)==0 is always true for any integer x.
-    _s = _RNG.randint(1000, 9999)
-    E_TRUE = f"(({_s}~{_s})==0)"
+    V_EXPECT_LEN = N()
+    V_EXPECT_HEX_LEN = N()
+    V_SOURCE = N()
+    V_FN = N()
+    V_ERR = N()
+    V_OK = N()
+    V_RESULT = N()
 
     lines = [
-        "-- This file was protected using Dex Obfuscator v6.1 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
+        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
-
-        # ── Capture all globals into locals immediately ───────────────────
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
         f"local {V_XPCALL}=xpcall",
@@ -5889,140 +5828,73 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local {V_WARN}=warn",
         f"local {V_STRING}=string",
         f"local {V_TABLE}=table",
-        f"local {V_MATH}=math",
-        f"local {V_RAWGET}=rawget",
-        f"local {V_SELECT}=select",
-
-        # ── Extended runtime capability probes ───────────────────────────
         f"if {V_TYPE}({V_STRING})~='table' or {V_TYPE}({V_TABLE})~='table' then",
         f"if {V_WARN} then {V_WARN}('[DEX] Runtime capability check failed.') end",
         f"{V_ERROR}('Unsupported Lua runtime: string/table unavailable')",
         "end",
-
         f"local {V_CHAR}={V_STRING}.char",
         f"local {V_LEN}={V_STRING}.len",
         f"local {V_SUB}={V_STRING}.sub",
         f"local {V_CONCAT}={V_TABLE}.concat",
         f"local {V_TONUM}=tonumber",
         f"local {V_LOAD}=loadstring or load",
-
-        # All required functions must exist.
-        f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function'"
-        f" or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function'"
-        f" or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function'"
-        f" or {V_TYPE}({V_RAWGET})~='function' or {V_TYPE}({V_SELECT})~='function' then",
+        f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
         f"if {V_WARN} then {V_WARN}('[DEX] Runtime capability check failed: required decoder functions are unavailable.') end",
         f"{V_ERROR}('Unsupported Lua runtime: required functions unavailable')",
         "end",
 
-        # ── Noise block 1 (dead computation) ─────────────────────────────
-        _noise_stmt(V_NOISE[0]),
-        _noise_stmt(V_NOISE[1]),
-
-        # ── Assemble payload from fragments ──────────────────────────────
-    ]
-
-    # Emit fragment locals then concatenate them.
-    for vf, piece in zip(V_FRAGS, fragment_pieces):
-        lines.append(f"local {vf}='{piece}'")
-
-    frag_concat = "..".join(V_FRAGS)
-    lines.append(f"local {V_DATA}={frag_concat}")
-
-    lines += [
-        # ── Structural check ─────────────────────────────────────────────
+        f"local {V_DATA}='{encoded}'",
         f"local {V_EXPECT_LEN}={source_length}",
         f"local {V_EXPECT_HEX_LEN}={encoded_length}",
-        f"local {V_SENTINEL}={E_TRUE}",
 
-        f"if {V_SENTINEL} and ({V_LEN}({V_DATA})~={V_EXPECT_HEX_LEN} or ({V_LEN}({V_DATA})%2)~=0) then",
+        # Structural check before decoding.
+        f"if {V_LEN}({V_DATA})~={V_EXPECT_HEX_LEN} or ({V_LEN}({V_DATA})%2)~=0 then",
         f"if {V_WARN} then {V_WARN}('[DEX] Structural integrity check failed.') end",
         f"{V_ERROR}('Protected payload structure check failed')",
         "end",
 
-        # ── Ciphertext checksum init ─────────────────────────────────────
-        f"local {V_CSUM_DJB2A}=0x{ct_djb2a:04X}",
-        f"local {V_CSUM_SDBM}=0x{ct_sdbm:04X}",
-        f"local {V_CSUM_FNV1A}=0x{ct_fnv1a:08X}",
-        f"local {V_CSUM_POLY}=0x{ct_poly:04X}",
-        f"local {V_CEXP_DJB2A}={ct_djb2a}",
-        f"local {V_CEXP_SDBM}={ct_sdbm}",
-        f"local {V_CEXP_FNV1A}={ct_fnv1a}",
-        f"local {V_CEXP_POLY}={ct_poly}",
+        f"local {V_OUT}={{}}",
+        f"local {V_SUM_A}=0x45D9",
+        f"local {V_SUM_B}=0xA7C3",
+        f"local {V_CSUM_A}=0x6D31",
+        f"local {V_CSUM_B}=0x91E7",
+        f"local {V_EXPECT_A}={checksum_a}",
+        f"local {V_EXPECT_B}={checksum_b}",
+        f"local {V_CEXPECT_A}={cipher_a}",
+        f"local {V_CEXPECT_B}={cipher_b}",
 
-        # Initialise to the correct seed values for the loop accumulation.
-        # We emitted the final values above; reset to seeds before the loop.
-        f"{V_CSUM_DJB2A}=0x6D31",
-        f"{V_CSUM_SDBM}=0x91E7",
-        f"{V_CSUM_FNV1A}=0x84222325",
-        f"{V_CSUM_POLY}=0x2A5C",
-
-        # ── Verify ciphertext integrity ──────────────────────────────────
+        # Verify the stored ciphertext independently before decoding.
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
         f"if {V_VALUE}==nil then",
         f"if {V_WARN} then {V_WARN}('[DEX] Encoded payload contains an invalid byte.') end",
         f"{V_ERROR}('Protected payload encoding check failed')",
         "end",
-        f"local _p=({V_I}+1)//2",
-        f"{V_CSUM_DJB2A}=({V_CSUM_DJB2A}*33~{V_VALUE}+_p)%4294967296",
-        f"{V_CSUM_SDBM}=({V_CSUM_SDBM}*65599+{V_VALUE}+(_p*29))%4294967296",
-        f"{V_CSUM_FNV1A}=(({V_CSUM_FNV1A}~{V_VALUE})*16777619+_p*11)%4294967296",
-        f"{V_CSUM_POLY}=({V_CSUM_POLY}*257+{V_VALUE}*19+_p*43)%4294967296",
+        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
+        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+((({V_I}+1)/2)*29))%4294967296",
         "end",
 
-        f"if {V_SENTINEL} and ({V_CSUM_DJB2A}~={V_CEXP_DJB2A} or {V_CSUM_SDBM}~={V_CEXP_SDBM}"
-        f" or {V_CSUM_FNV1A}~={V_CEXP_FNV1A} or {V_CSUM_POLY}~={V_CEXP_POLY}) then",
+        f"if {V_CSUM_A}~={V_CEXPECT_A} or {V_CSUM_B}~={V_CEXPECT_B} then",
         f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper check failed: encrypted payload was modified.') end",
         f"{V_ERROR}('Protected payload integrity check failed')",
         "end",
 
-        # ── Noise block 2 (dead computation) ─────────────────────────────
-        _noise_stmt(V_NOISE[2]),
-
-        # ── Plaintext checksum init ──────────────────────────────────────
-        f"local {V_OUT}={{}}",
-        f"local {V_SUM_DJB2A}=0x45D9",
-        f"local {V_SUM_SDBM}=0xA7C3",
-        f"local {V_SUM_FNV1A}=0x811C9DC5",
-        f"local {V_SUM_POLY}=0x1B3F",
-        f"local {V_EXP_DJB2A}={pt_djb2a}",
-        f"local {V_EXP_SDBM}={pt_sdbm}",
-        f"local {V_EXP_FNV1A}={pt_fnv1a}",
-        f"local {V_EXP_POLY}={pt_poly}",
-
-        # Cipher key locals (opaque expressions).
-        f"local _k1={E_KEY1}",
-        f"local _k2={E_KEY2}",
-        f"local _k3={E_KEY3}",
-
-        # ── Decode loop: three-key XOR ───────────────────────────────────
+        # Decode and verify plaintext independently.
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"local _p=({V_I}+1)//2",
-        # Reconstruct the same three-key stream: k1 XOR (k2*pos)&0xFF XOR (k3*(pos*pos)&0xFF)
-        f"local _kb=(_k1~((_k2*_p)%256)~((_k3*((_p*_p)%256))%256))%256",
-        f"{V_VALUE}=({V_VALUE}~_kb)%256",
-        f"{V_OUT}[_p]={V_CHAR}({V_VALUE})",
-        # Accumulate plaintext checksums.
-        f"{V_SUM_DJB2A}=({V_SUM_DJB2A}*33~{V_VALUE}+_p)%4294967296",
-        f"{V_SUM_SDBM}=({V_SUM_SDBM}*65599+{V_VALUE}+(_p*17))%4294967296",
-        f"{V_SUM_FNV1A}=(({V_SUM_FNV1A}~{V_VALUE})*16777619+_p*7)%4294967296",
-        f"{V_SUM_POLY}=({V_SUM_POLY}*257+{V_VALUE}*13+_p*31)%4294967296",
+        f"{V_VALUE}=({V_VALUE}-{key}-(((({V_I}-1)/2)*31)%256))%256",
+        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
+        f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
+        f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+((({V_I}+1)/2)*17))%4294967296",
         "end",
 
-        # ── Verify decoded length + all four plaintext checksums ─────────
-        f"if {V_SENTINEL} and ({V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN}"
-        f" or {V_SUM_DJB2A}~={V_EXP_DJB2A} or {V_SUM_SDBM}~={V_EXP_SDBM}"
-        f" or {V_SUM_FNV1A}~={V_EXP_FNV1A} or {V_SUM_POLY}~={V_EXP_POLY}) then",
+        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} then",
         f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper check failed: decoded payload was modified.') end",
         f"{V_ERROR}('Protected payload integrity check failed')",
         "end",
 
-        # ── Noise block 3 (dead computation) ─────────────────────────────
-        _noise_stmt(V_NOISE[3]),
-
-        # ── Compile and execute ──────────────────────────────────────────
+        # Compile the decoded source. xpcall is used when available, while
+        # keeping pcall as the portable fallback expected by older runtimes.
         f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
         f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
         f"if not {V_FN} then {V_ERROR}('Internal Error: '..{V_TOSTRING}({V_ERR})) end",
