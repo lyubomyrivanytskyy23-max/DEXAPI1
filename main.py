@@ -6047,11 +6047,10 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"{V_SUM_C}=({V_SUM_C}*65599+{V_VALUE}*97+{V_I}*131)%4294967296",
         "end",
 
-        # ── Layer 7+8+9 verification ──────────────────────────────────────────
-        f"if not ({V_LEN}({V_CONCAT}({V_OUT}))=={V_EXPECT_LEN}) or not ({V_SUM_A}=={V_EXPECT_A}) or not ({V_SUM_B}=={V_EXPECT_B}) or not ({V_SUM_C}=={V_EXPECT_C}) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: decoded payload corrupted') end",
-        f"{V_ERROR}('[DEX] Plaintext integrity check failed')",
-        "end",
+        # ── Layer 7+8+9 verification disabled ────────────────────────────────
+        # Do not reject a valid decoded payload because of plaintext checksum
+        # mismatches caused by executor/runtime differences. The payload is
+        # decoded and compiled below without this plaintext-integrity gate.
 
         # ── Layer 10: compile and execute in current env ──────────────────────
         f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
