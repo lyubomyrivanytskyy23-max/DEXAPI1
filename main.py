@@ -5817,7 +5817,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, s
     (V_TYPE, V_PCALL, V_LOAD, V_ERR, V_CHAR, V_LEN, V_SUB, V_TONUM,
      V_CONCAT, V_DATA, V_OUT, V_I, V_J, V_VALUE, V_PREV, V_TMP,
      V_A, V_B, V_CA, V_CB, V_PARTS, V_ORDER, V_BLOCK, V_POS, V_DEBUG,
-     V_OK, V_SOURCE, V_FN, V_T) = [N() for _ in range(28)]
+     V_OK, V_SOURCE, V_FN, V_T) = [N() for _ in range(29)]
 
     block_literal = "{" + ",".join(repr(x) for x in shuffled_blocks) + "}"
     order_literal = "{" + ",".join(str(x + 1) for x in order) + "}"
@@ -5856,7 +5856,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, s
         f"{V_TMP}={V_TMP}~(({V_VALUE}+(({V_I}+1)/2)*17)%4294967296)",
         f"{V_TMP}=({V_TMP}*0x01000193)%4294967296",
         f"{V_TMP}=(({V_TMP}~math.floor({V_TMP}/8192))%4294967296)",
-        f"local {V_POS}=({V_LEN}({V_DATA})-{V_I})/2+1",
+        f"local {V_POS}=({V_LEN}({V_DATA})/2)-(({V_I}-1)/2)",
         f"local {V_BLOCK}={V_TONUM}({V_SUB}({V_DATA},{V_I}*0+(({V_POS}-1)*2+1),(({V_POS}-1)*2+2)),16)",
         f"{V_J}={V_J}~(({V_BLOCK}+{V_POS}*17)%4294967296)",
         f"{V_J}=({V_J}*0x01000193)%4294967296",
