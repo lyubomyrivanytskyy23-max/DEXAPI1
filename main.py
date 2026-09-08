@@ -6407,7 +6407,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local oi=perm[di] local ai=bi+oi+1",
         f"st=(st*{_num_expr(_PRNG_MULT)}+{_num_expr(_PRNG_ADD)}+oi+di+bl)%65536",
         f"local v=d[bi+di+1] local cv=v",
-        f"v=v~((({e}>>{_num_expr(8)})+di*17+oi*31+st)%256)",
+        f"v=v~(((e>>{_num_expr(8)})+di*17+oi*31+st)%256)",
         f"v=v~((pc~((st>>{_num_expr(8)})%256)~(a%256)~((ai*11)%256))%256)",
         f"v=v~(((c%256)+di*29+(st%256)+ai*7+bl*{_num_expr(_MIX_D)})%256)",
         f"v=(v-((st>>{_num_expr(8)})~(e%256)~((ai*13)%256)~(di*{_num_expr(_MIX_C)}))%256)%256",
