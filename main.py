@@ -6020,7 +6020,7 @@ def _dex_encoder_wrap(source: str) -> str:
     parts.append(f"if not {Vok} then {Ver}('[DEX] Runtime error: '..tostring({Vrs})) end")
     parts.append(f"return {Vrs}")
 
-    inner = " ".join(parts)
+    inner = "\n".join(parts)
 
     # ── Junk padding (do...end blocks inserted before the inner code) ─────────
     # Same strategy as obfuscate_lua Layer 11: 140 locals per do-block, each
@@ -6039,19 +6039,19 @@ def _dex_encoder_wrap(source: str) -> str:
         for _ in range(LOCALS_BLOCK):
             n = _junk_fenv_name(used)
             frags.append(f"local {n}=({_RNG.randint(1,0xFFFF)}*{_RNG.randint(1,0xFFFF)})%{_RNG.randint(1,0xFFFF)+1}")
-        block = "do " + " ".join(frags) + " end"
+        block = "do\n" + "\n".join(frags) + "\nend"
         junk_blocks.append(block)
         pad_bytes += len(block) + 1
         if pad_bytes >= deficit:
             break
 
-    junk_str = " ".join(junk_blocks)
+    junk_str = "\n".join(junk_blocks)
     if junk_str:
-        inner = junk_str + " " + inner
+        inner = junk_str + "\n" + inner
 
     # ── Assemble 3-line output ────────────────────────────────────────────────
     header = "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]"
-    code_line = f"return(function(...) {inner} end)(...)"
+    code_line = "return(function(...)\n" + inner + "\nend)(...)"
 
     return header + "\n\n" + code_line
 
@@ -6315,7 +6315,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     # ── Assemble the 3-line output ─────────────────────────────────────────────
     comment_line = lines[0]
-    code_line    = " ".join(x.strip() for x in lines[2:] if x.strip())
+    code_line    = "\n".join(x.strip() for x in lines[2:] if x.strip())
 
     # Size-scaling: 1 KB per source line.
     if target_bytes and target_bytes > 0:
@@ -6349,18 +6349,18 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
                 n    = _junk_fenv_name(used)
                 frag = f"local {n}=({_RNG.randint(1,0xFFFF)}*{_RNG.randint(1,0xFFFF)})%{_RNG.randint(1,0xFFFF)+1}"
                 frags.append(frag)
-            block = "do " + " ".join(frags) + " end"
+            block = "do\n" + "\n".join(frags) + "\nend"
             blocks.append(block)
             pad_bytes += len(block) + 1
             if pad_bytes >= deficit:
                 break
 
-        pad_str  = " ".join(blocks)
+        pad_str  = "\n".join(blocks)
         code_line = (
             code_line[:splice_pos]
-            + " "
+            + "\n"
             + pad_str
-            + " "
+            + "\n"
             + code_line[splice_pos:]
         )
 
