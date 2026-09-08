@@ -6222,6 +6222,13 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     V_DATA    = N(); V_IDX   = N(); V_FRAGS = N(); V_ORDER    = N()
     V_REASSEM = N(); V_K     = N()
 
+    # Runtime-compatible arithmetic bit helpers.  The previous decoder emitted
+    # Lua 5.3/Luau-only `~`, `>>`, and `|` operators.  Those tokens are not
+    # valid in Lua 5.1/5.2 and were the direct cause of parser errors such as
+    # "Expected identifier when parsing expression, got '~'".  Keep the same
+    # cipher math, but express it using portable Lua arithmetic instead.
+    V_BXOR   = N(); V_RSHIFT = N()
+
     # Cipher state variable names (decode side)
     V_S1 = N(); V_S2 = N(); V_S3 = N(); V_S4 = N()
     V_BS1= N(); V_BS2= N()
@@ -6300,6 +6307,16 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local {V_BIT32}=bit32",
         f"local {V_GFE}=getfenv",
         f"local {V_ENV}={V_GFE} and {V_GFE}(1) or _ENV or {{}}",
+
+        # ── Portable bit helpers ──
+        # BXOR is byte-oriented because every cipher XOR operand is reduced to
+        # an 8-bit value.  Prefer bit32 when present, otherwise use arithmetic
+        # so the generated payload remains valid on Lua 5.1/5.2 as well.
+        f"local function {V_BXOR}(a,b,c,d)",
+        f"a=math.floor(a)%256 b=math.floor(b)%256 if c~=nil then c=math.floor(c)%256 end if d~=nil then d=math.floor(d)%256 end local r=0 local p=1",
+        f"for _=1,8 do local bit=(a%2+b%2)%2 if c~=nil then bit=(bit+c%2)%2 end if d~=nil then bit=(bit+d%2)%2 end if bit==1 then r=r+p end a=math.floor(a/2) b=math.floor(b/2) if c~=nil then c=math.floor(c/2) end if d~=nil then d=math.floor(d/2) end p=p*2 end",
+        f"return r%256 end",
+        f"local function {V_RSHIFT}(a,n) return math.floor(a/(2^n)) end",
 
         # ── Hard environment check ──
         f"if {V_TYPE}(string)~='table' or {V_TYPE}(table)~='table' or {V_TYPE}({V_LOAD})~='function' then",
@@ -6407,11 +6424,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local oi=perm[di] local ai=bi+oi+1",
         f"st=(st*{_num_expr(_PRNG_MULT)}+{_num_expr(_PRNG_ADD)}+oi+di+bl)%65536",
         f"local v=d[bi+di+1] local cv=v",
-        f"v=v~(((e>>{_num_expr(8)})+di*17+oi*31+st)%256)",
-        f"v=v~((pc~((st>>{_num_expr(8)})%256)~(a%256)~((ai*11)%256))%256)",
-        f"v=v~(((c%256)+di*29+(st%256)+ai*7+bl*{_num_expr(_MIX_D)})%256)",
-        f"v=(v-((st>>{_num_expr(8)})~(e%256)~((ai*13)%256)~(di*{_num_expr(_MIX_C)}))%256)%256",
-        f"local rot=((b+oi+di+st+bl)%8) v=((v>>rot)|(v<<(8-rot)))%256",
+        f"v={V_BXOR}(v,(({V_RSHIFT}(e,{_num_expr(8)})+di*17+oi*31+st)%256))",
+        f"v={V_BXOR}(v,{V_BXOR}(pc,{V_RSHIFT}(st,{_num_expr(8)})%256,a%256,(ai*11)%256))",
+        f"v={V_BXOR}(v,((c%256)+di*29+(st%256)+ai*7+bl*{_num_expr(_MIX_D)})%256)",
+        f"v=(v-{V_BXOR}({V_RSHIFT}(st,{_num_expr(8)}),e%256,(ai*13)%256,(di*{_num_expr(_MIX_C)})%256))%256",
+        f"local rot=((b+oi+di+st+bl)%8) local rp=2^rot v=(math.floor(v/rp)+(v%rp)*2^(8-rot))%256",
         f"out[oi]=v pc=cv end",
         f"for di=0,bl-1 do r[bi+di+1]=out[di] end end return r end",
         # Round 3 inverse
