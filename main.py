@@ -6278,7 +6278,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     # ── assemble payload lines ────────────────────────────────────────────────
     lines = [
         # HEADER (line 0)
-        "-- This file was protected using Dex Obfuscator v8.0 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
+        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         # blank line (line 1)
         "",
         # PAYLOAD (line 2 onward — joined to one line later)
