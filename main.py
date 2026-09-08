@@ -5951,12 +5951,12 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_GAME}=game",
         f"local {V_INST}=Instance",
         f"if not {V_GAME} or not ({V_TYPE}({V_GAME})=='userdata') then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: not a Roblox client') end",
-        f"{V_ERROR}('[DEX] Invalid execution environment')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected No Source For You :D [.gg/dexfinder]') end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"if not {V_INST} or not ({V_TYPE}({V_INST})=='table') then",
         f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: Instance API missing') end",
-        f"{V_ERROR}('[DEX] Invalid execution environment')",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
 
         # ── Layer 3: _G integrity — detect hooked stdlib functions ────────────
