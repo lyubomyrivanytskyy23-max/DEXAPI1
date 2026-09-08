@@ -5723,40 +5723,53 @@ def _build_loadstring(raw_url):
     return "loadstring(game:HttpGet(" + json.dumps(raw_url) + "))()"
 
 
-def _line_scaled_padding(source: str, current_payload: str, cap_bytes: int = 3_000_000) -> str:
-    """Add inert Lua comments so output size scales with source line count."""
+def _target_obfuscation_size(source: str) -> int:
+    """Scale the generated wrapper toward ~1 KiB per input source line.
+
+    The target is deliberately capped so a pathological source cannot make the
+    generated Lua grow without bound.  The filler is inert Lua executed only as
+    local assignments, so it does not alter the original program's behavior.
+    """
     line_count = max(1, source.count("\n") + 1)
-    target_bytes = min(line_count * 1000, cap_bytes)
-    current_bytes = len(current_payload.encode("utf-8"))
+    return min(3 * 1024 * 1024, max(4 * 1024, line_count * 1024))
+
+
+def _make_inert_junk_lines(used, target_bytes: int, current_bytes: int):
+    """Create deterministic-size, syntactically valid inert Lua junk.
+
+    Names and values are randomized for every build.  The junk is deliberately
+    side-effect free: it only creates locals and evaluates opaque arithmetic.
+    """
     if current_bytes >= target_bytes:
-        return current_payload
-    remaining = target_bytes - current_bytes
-    pieces = []
-    counter = 0
-    while remaining > 0:
-        counter += 1
-        line = f"\n-- DEX inert padding {counter:06d}:{secrets.token_hex(12)}\n"
-        n = len(line.encode("utf-8"))
-        if n > remaining:
-            filler = "\n-- DEX " + ("x" * max(0, remaining - len("\n-- DEX ".encode("utf-8"))))
-            if len(filler.encode("utf-8")) <= remaining:
-                pieces.append(filler)
-            break
-        pieces.append(line)
-        remaining -= n
-    return current_payload + "".join(pieces)
+        return []
+
+    junk = []
+    estimated = current_bytes
+    while estimated < target_bytes:
+        name = _unique_name(used)
+        a = _RNG.randint(1000, 900000)
+        b = _RNG.randint(1000, 900000)
+        c = _RNG.randint(1, 255)
+        expr = f"local {name}=(({a}+{b})-{b}+({c}-{c}))"
+        junk.append(expr)
+        estimated += len(expr) + 1
+
+    return junk
 
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -> str:
-    """Build the DEX Lua wrapper with line-count-scaled inert padding.
+    """Build the public Dex Lua wrapper with randomized reversible encoding.
 
-    Target output sizing is approximately 1,000 bytes per source line, capped
-    at 3 MB. Padding consists only of Lua comments and therefore does not
-    alter executable behavior.
+    Output format is intentionally preserved:
+      line 1: Dex header
+      line 2: blank
+      line 3: one long executable payload line
 
-    This function intentionally does not attempt to identify or block
-    debuggers/dumpers. A network request cannot reliably classify an execution
-    environment and can break legitimate users behind proxies/firewalls.
+    The payload size scales with the number of source lines, up to 3 MiB.  The
+    extra bytes are inert locals/arithmetic and do not change the source program.
+    This function does not rely on network access or attempt to identify a
+    debugger/dumper, because client-side environment detection is inherently
+    unreliable and can break legitimate executors/runtimes.
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -5767,9 +5780,26 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         raise ValueError("Lua source is empty.")
 
     normalize_obf_level(level)
+
     src = source.encode("utf-8")
-    key = _RNG.randint(1, 255)
-    encrypted = bytes((value + key + ((index * 31) & 0xFF)) & 0xFF for index, value in enumerate(src))
+
+    # Four independent reversible byte-mixing parameters.  They are embedded
+    # into the generated decoder, so every build has a different stream.
+    key1 = _RNG.randint(1, 255)
+    key2 = _RNG.randint(1, 255)
+    key3 = _RNG.randint(1, 255)
+    key4 = _RNG.randint(1, 255)
+
+    encrypted = bytearray(len(src))
+    previous = key4
+    for index, value in enumerate(src, 1):
+        x = value ^ ((key1 + index * 17) & 0xFF)
+        x = (x + key2 + ((index * 29) & 0xFF)) & 0xFF
+        x = _rotl8(x, (key3 + index) & 7)
+        x ^= previous
+        x ^= ((key4 + index * 43) & 0xFF)
+        encrypted[index - 1] = x
+        previous = x
 
     checksum = 0x45D9
     for index, value in enumerate(src, 1):
@@ -5777,11 +5807,13 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
 
     used = set()
     N = lambda: _unique_name(used)
+
     V_CHAR, V_LEN, V_SUB, V_CONCAT = N(), N(), N(), N()
     V_TONUM, V_LOAD, V_ERR, V_I, V_SUM = N(), N(), N(), N(), N()
     V_DATA, V_OUT, V_VALUE, V_EXPECT = N(), N(), N(), N()
     V_TYPE, V_PCALL, V_DEBUG, V_OK = N(), N(), N(), N()
-    V_SOURCE, V_FN = N(), N()
+    V_SOURCE, V_FN, V_PREV, V_X = N(), N(), N(), N()
+
     encoded = encrypted.hex()
 
     lines = [
@@ -5791,10 +5823,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
         f"local {V_LOAD}=loadstring or load",
-        f"if {V_TYPE}(string)~='table' or {V_TYPE}(table)~='table' or {V_TYPE}({V_LOAD})~='function' then",
-        "if warn then warn('[DEX] Environment check failed: required Lua runtime functions are unavailable.') end",
-        "error('Unsupported Lua runtime')",
-        "end",
+        f"if {V_TYPE}({V_LOAD})~='function' then error('Unsupported Lua runtime') end",
         f"local {V_CHAR}=string.char",
         f"local {V_LEN}=string.len",
         f"local {V_SUB}=string.sub",
@@ -5804,20 +5833,23 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local {V_OUT}={{}}",
         f"local {V_SUM}=0x45D9",
         f"local {V_EXPECT}={checksum}",
+        f"local {V_PREV}={key4}",
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"{V_VALUE}=({V_VALUE}-{key}-((({V_I}-1)/2)*31)%256)%256",
-        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
-        f"{V_SUM}=({V_SUM}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
+        f"local {V_X}={V_VALUE}~{V_PREV}",
+        f"{V_X}={V_X}~(({key4}+((({V_I}+1)/2)*43))%256)",
+        f"{V_X}=({V_X}-{key2}-(((({V_I}+1)/2)*29)%256))%256",
+        f"local {V_OK}=({key3}+(({V_I}+1)/2))%8",
+        f"if {V_OK}==0 then {V_X}={V_X} else {V_X}=((math.floor({V_X}/(2^{V_OK})))+(({V_X}%2^{V_OK})*(2^(8-{V_OK}))))%256 end",
+        f"{V_X}={V_X}~(({key1}+((({V_I}+1)/2)*17))%256)",
+        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_X})",
+        f"{V_SUM}=({V_SUM}*33+{V_X}+(({V_I}+1)/2))%4294967296",
+        f"{V_PREV}={V_VALUE}",
         "end",
-        f"if {V_SUM}~={V_EXPECT} then",
-        "if warn then warn('[DEX] Anti-tamper check failed: protected payload was modified.') end",
-        "error('Protected payload integrity check failed')",
-        "end",
+        f"if {V_SUM}~={V_EXPECT} then error('Protected payload integrity check failed') end",
         f"local {V_DEBUG}=debug",
         f"if {V_TYPE}({V_DEBUG})=='table' and {V_TYPE}({V_DEBUG}.getinfo)=='function' then",
-        f"local {V_OK}={V_PCALL}({V_DEBUG}.getinfo,1,'f')",
-        f"if not {V_OK} and warn then warn('[DEX] Environment warning: debug API behaved unexpectedly.') end",
+        f"{V_PCALL}({V_DEBUG}.getinfo,1,'f')",
         "end",
         f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
         f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
@@ -5825,10 +5857,29 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"return {V_FN}(...)",
         "end)(...)",
     ]
-    payload = lines[0] + "\n\n" + "\n".join(x.strip() for x in lines[2:] if x.strip())
-    payload = _line_scaled_padding(source, payload)
+
+    # Keep the requested three-line physical format.  The executable payload
+    # itself is one line; junk is appended inside the function before decoding.
+    # This means the junk contributes directly to the final payload byte size.
+    base_payload = " ".join(x.strip() for x in lines[2:] if x.strip())
+    target_bytes = _target_obfuscation_size(source)
+    junk = _make_inert_junk_lines(used, target_bytes, len(base_payload))
+
+    if junk:
+        marker = f"local {N()}={{}}"
+        junk_blob = " ".join(junk)
+        # Insert junk immediately after the function opens, before the decoder.
+        base_payload = base_payload.replace(
+            "return(function(...) ",
+            "return(function(...) " + marker + " " + junk_blob + " ",
+            1,
+        )
+
+    payload = lines[0] + "\n\n" + base_payload
+
     if publish:
         _raw_backend_publish(payload)
+
     return payload
 
 
