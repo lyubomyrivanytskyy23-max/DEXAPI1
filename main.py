@@ -5572,7 +5572,7 @@ def _publish_local_payload(payload: str):
     loader_id = _create_raw_loader_id()
     path = _raw_loader_path(loader_id)
     _atomic_write(path, payload, mode=0o600)
-    raw_url = f"https://dexnotifier.xyz/raw/{loader_id}"
+    raw_url = f"https://dexapi1.up.railway.app/raw/{loader_id}"
     return raw_url, loader_id
 
 
@@ -5642,7 +5642,7 @@ async def create_raw_loader(request: Request):
 
     await clear_attempts("raw_loader_auth", ip)
 
-    raw_url = f"https://dexnotifier.xyz/raw/{loader_id}"
+    raw_url = f"https://dexapi1.up.railway.app/raw/{loader_id}"
     return JSONResponse(
         {
             "ok": True,
