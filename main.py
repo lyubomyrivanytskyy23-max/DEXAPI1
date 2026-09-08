@@ -6303,7 +6303,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
 
         # ── Hard environment check ──
         f"if {V_TYPE}(string)~='table' or {V_TYPE}(table)~='table' or {V_TYPE}({V_LOAD})~='function' then",
-        "if warn then warn('[DEX] Environment check failed: required Lua runtime functions are unavailable.') end",
+        "if warn then warn('[DEX] Failed') end",
         "error('Unsupported Lua runtime')",
         "end",
         f"if {V_TYPE}(math)~='table' or {V_TYPE}(math.floor)~='function' then",
@@ -6377,7 +6377,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"{V_CK3}=({V_CK3}*283+{V_VALUE}*11+{V_I}*19)%65536",
         "end",
         f"if {V_CK1}~={V_CH1} or {V_CK2}~={V_CH2} or {V_CK3}~={V_CH3} then",
-        "if warn then warn('[DEX] Cipher integrity check failed: encrypted data was tampered with.') end",
+        "if warn then warn('[DEX] Tamper Detected No Source For You :D [.gg/dexfinder]') end",
         "error('Cipher integrity check failed')",
         "end",
 
