@@ -874,6 +874,7 @@ def _cipher_digest(data):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _num_expr(value):
+    """Generate Lua arithmetic that evaluates to an exact integer."""
     value = int(value)
 
     if value == 0:
@@ -883,7 +884,7 @@ def _num_expr(value):
     if value < 0:
         return f"-({_num_expr(-value)})"
 
-    style = _RNG.randint(0, 8)
+    style = _RNG.randint(0, 6)
 
     if style == 0:
         a = _RNG.randint(1, 5000)
@@ -907,21 +908,12 @@ def _num_expr(value):
         return f"(({value}*1)+{a}-{a})"
 
     if style == 5:
-        a = _RNG.randint(2, 31)
-        return f"(({value}*{a})/{a})"
-
-    if style == 6:
         a = _RNG.randint(1, 300)
         b = _RNG.randint(1, 300)
         return f"((({value}+{a})-{a})+({b}-{b}))"
 
-    if style == 7:
-        a = _RNG.randint(1, 1000)
-        return f"(({value}+{a})-{a})"
-
-    a = _RNG.randint(2, 19)
-    return f"(({value}*{a})/{a})"
-
+    a = _RNG.randint(1, 1000)
+    return f"(({value}+{a})-{a})"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # LUA ESCAPING
@@ -6150,134 +6142,229 @@ def _compute_junk_count(source_line_count: int) -> int:
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -> str:
     """
-    Generate a syntax-safe self-decoding Lua/Luau wrapper.
+    DEX Obfuscator compatibility wrapper.
 
-    The previous generator built a very large one-line program from many
-    independently generated junk expressions.  That made a single malformed
-    junk expression capable of breaking the whole payload.  This implementation
-    deliberately keeps the executable grammar small and deterministic:
+    Keeps the multi-round cipher, shuffled token stream, and integrity digests,
+    while emitting an arithmetic-only Lua decoder.  The generated wrapper does
+    not rely on '~', '>>', or '<<', so it is accepted by Lua 5.1-style parsers
+    as well as Luau.
 
-      1. UTF-8 source -> bytes
-      2. randomized two-stage byte transform
-      3. decimal byte storage (no generated Lua operators or identifiers)
-      4. runtime inverse transform
-      5. ciphertext + plaintext integrity checks
-      6. compile the recovered source before executing it
-
-    It does not attempt to identify, whitelist, or evade particular executors.
+    Integrity checks are content-based: changed/truncated data is rejected as
+    corrupted payload data rather than being classified as executor tampering.
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
     if not isinstance(source, str):
         source = str(source)
-    if not source.strip():
+
+    source = source.strip()
+    if not source:
         raise ValueError("Lua source is empty.")
 
     level = normalize_obf_level(level)
-    plain = source.encode("utf-8")
+    cfg = _OBF_LEVELS[level]
+    src = source.encode("utf-8")
 
-    # Per-output random key material.  The key is embedded in the wrapper,
-    # which is obfuscation rather than secret-key cryptography, but it prevents
-    # identical inputs from producing identical payloads.
-    rng = random.SystemRandom()
-    key = [rng.randrange(1, 256) for _ in range(8)]
+    # Three rounds of the existing permutation/rotation/XOR/feedback cipher.
+    s1 = _RNG.randint(0x1000, 0xEFFF)
+    s2 = _RNG.randint(0x1000, 0xEFFF)
+    s3 = _RNG.randint(0x1000, 0xEFFF)
+    s4 = _RNG.randint(0x1000, 0xEFFF)
+    bs1 = _RNG.randint(*cfg["block1"])
+    bs2 = _RNG.randint(*cfg["block2"])
 
-    def _bxor8(a, b):
-        a &= 0xFF
-        b &= 0xFF
-        out = 0
-        bit = 1
-        for _ in range(8):
-            if (a & 1) != (b & 1):
-                out |= bit
-            a >>= 1
-            b >>= 1
-            bit <<= 1
-        return out
+    enc = _encrypt_round(src, s1, s2, s3, s4, bs1)
+    enc = _encrypt_round(enc, s3, s1, s4, s2, bs2)
+    enc = _encrypt_round(enc, s4, s3, s2, s1, bs1)
 
-    # Two reversible transforms.  Everything is byte-bounded so the same
-    # arithmetic works in ordinary Lua 5.x and Luau without bitwise syntax.
-    encrypted = []
-    for i, value in enumerate(plain, 1):
-        k1 = key[(i - 1) % len(key)]
-        k2 = key[(i + 2) % len(key)]
-        v = (value + k1 + (i * 13)) % 256
-        v = _bxor8(v, (k2 + (i * 7)) % 256)
-        v = (v + key[(i + 4) % len(key)] + (i * 3)) % 256
-        encrypted.append(v)
+    ih1, ih2, ih3, ih4 = _integrity_digest(src)
+    ch1, ch2, ch3 = _cipher_digest(enc)
 
-    def _digest(values):
-        a = 0x1357
-        b = 0x2468
-        c = 0x369C
-        d = 0x4ACE
-        for i, value in enumerate(values, 1):
-            a = (a * 257 + value + i) % 65536
-            b = (b * 263 + value * 3 + i * 7) % 65536
-            c = (c * 269 + value * 5 + i * 11) % 65536
-            d = (d * 271 + value * 7 + i * 17) % 65536
-        return a, b, c, d
+    tok0, tok1 = _make_token_alphabet()
+    token_encoded = _encode_binary_tokens(enc, tok0, tok1)
 
-    c1, c2, c3, c4 = _digest(encrypted)
-    p1, p2, p3, p4 = _digest(plain)
+    frag_min, frag_max = cfg["fragment"]
+    indexed_frags = _fragment_tokens(token_encoded, frag_min, frag_max)
 
-    # Decimal-only data is intentionally used here.  It avoids quoted-string
-    # escaping problems entirely, including source containing quotes, brackets,
-    # long comments, Unicode, or unusual Luau syntax.
-    data = ",".join(str(x) for x in encrypted)
-    key_lua = ",".join(str(x) for x in key)
+    used = set()
+    N = lambda: _unique_name(used)
 
-    # Keep the generated Lua grammar deliberately boring.  In particular there
-    # are no generated function bodies, opaque-number expressions, bitwise
-    # operators, or executor/environment probes.
+    V_TYPE = N(); V_PCALL = N(); V_LOAD = N(); V_TOSTRING = N()
+    V_CHAR = N(); V_LEN = N(); V_SUB = N(); V_CONCAT = N()
+    V_SUM = N(); V_BYTE = N(); V_TMP = N(); V_DATA = N()
+    V_FRAGS = N(); V_ORDER = N(); V_I = N(); V_VALUE = N()
+    V_SOURCE = N(); V_FN = N(); V_ERR = N()
+    V_S1 = N(); V_S2 = N(); V_S3 = N(); V_S4 = N()
+    V_BS1 = N(); V_BS2 = N()
+    V_IH1 = N(); V_IH2 = N(); V_IH3 = N(); V_IH4 = N()
+    V_CH1 = N(); V_CH2 = N(); V_CH3 = N()
+    V_CK1 = N(); V_CK2 = N(); V_CK3 = N()
+    V_CK4 = N(); V_CK5 = N(); V_CK6 = N(); V_CK7 = N()
+    V_TOK0 = N(); V_TOK1 = N()
+    V_K = N(); V_DI = N(); V_DJ = N()
+    V_XOR = N(); V_RSHIFT = N(); V_ROT_R = N()
+
+    frag_table_lua = "{" + ",".join(
+        f'"{frag_str}"' for _original_idx, frag_str in indexed_frags
+    ) + "}"
+    order_table_lua = "{" + ",".join(
+        str(original_idx) for original_idx, _frag_str in indexed_frags
+    ) + "}"
+
+    total_frags = len(indexed_frags)
+
+    # Keep a small amount of inert arithmetic noise.  Unlike the old version,
+    # it never probes getfenv/debug/game/workspace and therefore does not make
+    # normal executor differences look like tampering.
+    source_line_count = max(1, source.count("\n") + 1)
+    noise_count = max(4, min(source_line_count // 2 + 4, 80))
+    noise_parts = []
+    for _ in range(noise_count):
+        v = N()
+        noise_parts.append(f"local {v}={_num_expr(_RNG.randint(0, 65535))}")
+    noise_block = " ".join(noise_parts)
+
+    E_S1 = _num_expr(s1); E_S2 = _num_expr(s2)
+    E_S3 = _num_expr(s3); E_S4 = _num_expr(s4)
+    E_BS1 = _num_expr(bs1); E_BS2 = _num_expr(bs2)
+    E_IH1 = _num_expr(ih1); E_IH2 = _num_expr(ih2)
+    E_IH3 = _num_expr(ih3); E_IH4 = _num_expr(ih4)
+    E_CH1 = _num_expr(ch1); E_CH2 = _num_expr(ch2); E_CH3 = _num_expr(ch3)
+
     lines = [
-        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder]",
+        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
-        "local _K={" + key_lua + "}",
-        "local _D={" + data + "}",
-        f"local _C1={c1} local _C2={c2} local _C3={c3} local _C4={c4}",
-        f"local _P1={p1} local _P2={p2} local _P3={p3} local _P4={p4}",
-        "local function _X(a,b)",
-        "a=math.floor(a)%256 b=math.floor(b)%256 local r=0 local p=1",
-        "for _=1,8 do local x=a%2 local y=b%2 if x~=y then r=r+p end a=math.floor(a/2) b=math.floor(b/2) p=p*2 end",
+        noise_block,
+
+        f"local {V_TYPE}=type",
+        f"local {V_PCALL}=pcall",
+        f"local {V_TOSTRING}=tostring",
+        f"local {V_LOAD}=loadstring or load",
+        f"local {V_CHAR}=string.char",
+        f"local {V_LEN}=string.len",
+        f"local {V_SUB}=string.sub",
+        f"local {V_CONCAT}=table.concat",
+
+        # Portable XOR implementation: no '~' operator.
+        f"local function {V_XOR}(a,b)",
+        "a=a%256 b=b%256 local r=0 local p=1",
+        "for q=1,8 do local aa=a%2 local bb=b%2 if aa~=bb then r=r+p end a=(a-aa)/2 b=(b-bb)/2 p=p*2 end",
+        "return r end",
+
+        f"local function {V_RSHIFT}(a,n)",
+        "return math.floor((a%256)/(2^n))",
+        "end",
+
+        f"local function {V_ROT_R}(a,n)",
+        "a=a%256 n=n%8 if n==0 then return a end",
+        "local p=2^n return math.floor(a/p)+(a%p)*(2^(8-n))",
+        "end",
+
+        f"local {V_S1}={E_S1}", f"local {V_S2}={E_S2}",
+        f"local {V_S3}={E_S3}", f"local {V_S4}={E_S4}",
+        f"local {V_BS1}={E_BS1}", f"local {V_BS2}={E_BS2}",
+        f"local {V_IH1}={E_IH1}", f"local {V_IH2}={E_IH2}",
+        f"local {V_IH3}={E_IH3}", f"local {V_IH4}={E_IH4}",
+        f"local {V_CH1}={E_CH1}", f"local {V_CH2}={E_CH2}", f"local {V_CH3}={E_CH3}",
+        f"local {V_TOK0}='{tok0}'", f"local {V_TOK1}='{tok1}'",
+        f"local {V_FRAGS}={frag_table_lua}",
+        f"local {V_ORDER}={order_table_lua}",
+
+        f"local {V_TMP}={{}}",
+        f"for {V_I}=1,{_num_expr(total_frags)} do {V_TMP}[{V_ORDER}[{V_I}]+1]={V_FRAGS}[{V_I}] end",
+        f"local {V_DATA}={V_CONCAT}({V_TMP})",
+
+        f"local {V_BYTE}={{}}",
+        f"local {V_K}=0",
+        f"for {V_I}=1,{V_LEN}({V_DATA}),8 do",
+        f"local {V_VALUE}=0",
+        f"for {V_DI}=0,7 do",
+        f"local {V_DJ}={V_SUB}({V_DATA},{V_I}+{V_DI},{V_I}+{V_DI})",
+        f"if {V_DJ}=={V_TOK1} then {V_VALUE}={V_VALUE}*2+1 else {V_VALUE}={V_VALUE}*2 end",
+        "end",
+        f"{V_K}={V_K}+1 {V_BYTE}[{V_K}]={V_VALUE}",
+        "end",
+
+        # Cipher digest.
+        f"local {V_CK1}=0x5A31 local {V_CK2}=0x71C9 local {V_CK3}=0x42D7",
+        f"for {V_I}=1,#{V_BYTE} do",
+        f"local {V_VALUE}={V_BYTE}[{V_I}]",
+        f"{V_CK1}=({V_CK1}*251+{V_VALUE}+{V_I}*3)%65536",
+        f"{V_CK2}=({V_CK2}*277+{V_VALUE}*7+{V_I}*13)%65536",
+        f"{V_CK3}=({V_CK3}*283+{V_VALUE}*11+{V_I}*19)%65536",
+        "end",
+        f"if {V_CK1}~={V_CH1} or {V_CK2}~={V_CH2} or {V_CK3}~={V_CH3} then",
+        "error('Protected payload corrupted: cipher integrity check failed')",
+        "end",
+
+        # Exact inverse of the Python encryption rounds.
+        "do",
+        f"local function {V_TMP}(d,a,b,c,e,bs)",
+        "local r={} local n=#d",
+        "for bi=0,n-1,bs do",
+        "local bl=math.min(bs,n-bi)",
+        f"local ps=(a+b+c*(bi+1)+e*bl+bi*{_num_expr(_MIX_A)})%65536",
+        "local perm={}",
+        "do",
+        f"local st=ps for pi=0,bl-1 do perm[pi]=pi end",
+        f"for pi=bl-1,1,-1 do st=(st*{_num_expr(_PRNG_MULT)}+{_num_expr(_PRNG_ADD)}+pi*97)%65536 local si=st%(pi+1) perm[pi],perm[si]=perm[si],perm[pi] end",
+        "end",
+        f"local st=(a+c+(bi+1)*17+bl*{_num_expr(_MIX_B)})%65536",
+        "local pc=(e+bi+bl)%256",
+        "local out={}",
+        "for di=0,bl-1 do",
+        "local oi=perm[di] local ai=bi+oi+1",
+        f"st=(st*{_num_expr(_PRNG_MULT)}+{_num_expr(_PRNG_ADD)}+oi+di+bl)%65536",
+        "local v=d[bi+di+1] local cv=v",
+        f"v={V_XOR}(v,({V_RSHIFT}(e,8)+di*17+oi*31+st)%256)",
+        f"v={V_XOR}(v,{V_XOR}({V_XOR}({V_XOR}(pc,{V_RSHIFT}(st,8)),a%256),(ai*11)%256))",
+        f"v={V_XOR}(v,((c%256)+di*29+(st%256)+ai*7+bl*{_num_expr(_MIX_D)})%256)",
+        f"v=(v-{V_XOR}({V_XOR}({V_XOR}({V_RSHIFT}(st,8),e%256),(ai*13)%256),(di*{_num_expr(_MIX_C)})%256))%256",
+        f"v={V_ROT_R}(v,(b+oi+di+st+bl)%8)",
+        "out[oi]=v pc=cv",
+        "end",
+        "for di=0,bl-1 do r[bi+di+1]=out[di] end",
+        "end",
         "return r",
         "end",
-        "local _B={} local _A=0",
-        "for _I=1,#_D do",
-        "local _V=_D[_I]",
-        "_V=(_V-_K[(_I+4)%8+1]-(_I*3))%256",
-        "_V=_X(_V,(_K[(_I+2-1)%8+1]+(_I*7))%256)",
-        "_V=(_V-_K[(_I-1)%8+1]-(_I*13))%256",
-        "_A=_A+1 _B[_A]=_V",
+
+        f"local {V_BYTE}={V_TMP}({V_BYTE},{V_S4},{V_S3},{V_S2},{V_S1},{V_BS1})",
+        f"{V_BYTE}={V_TMP}({V_BYTE},{V_S3},{V_S1},{V_S4},{V_S2},{V_BS2})",
+        f"{V_BYTE}={V_TMP}({V_BYTE},{V_S1},{V_S2},{V_S3},{V_S4},{V_BS1})",
         "end",
-        "local _H1=0x1357 local _H2=0x2468 local _H3=0x369C local _H4=0x4ACE",
-        "for _I=1,#_D do local _V=_D[_I] _H1=(_H1*257+_V+_I)%65536 _H2=(_H2*263+_V*3+_I*7)%65536 _H3=(_H3*269+_V*5+_I*11)%65536 _H4=(_H4*271+_V*7+_I*17)%65536 end",
-        "if _H1~=_C1 or _H2~=_C2 or _H3~=_C3 or _H4~=_C4 then error('Cipher integrity check failed') end",
-        "local _S={} for _I=1,#_B do _S[_I]=string.char(_B[_I]) end",
-        "local _SOURCE=table.concat(_S)",
-        f"if string.len(_SOURCE)~={len(plain)} then error('Protected payload length check failed') end",
-        "local _Q1=0x1357 local _Q2=0x2468 local _Q3=0x369C local _Q4=0x4ACE",
-        "for _I=1,#_B do local _V=_B[_I] _Q1=(_Q1*257+_V+_I)%65536 _Q2=(_Q2*263+_V*3+_I*7)%65536 _Q3=(_Q3*269+_V*5+_I*11)%65536 _Q4=(_Q4*271+_V*7+_I*17)%65536 end",
-        "if _Q1~=_P1 or _Q2~=_P2 or _Q3~=_P3 or _Q4~=_P4 then error('Protected payload integrity check failed') end",
-        "local _LOAD=loadstring or load",
-        "if type(_LOAD)~='function' then error('Unsupported Lua runtime: loadstring/load unavailable') end",
-        "local _FN,_ERR=_LOAD(_SOURCE)",
-        "if not _FN then error('Decoded payload syntax error: '..tostring(_ERR)) end",
-        "return _FN(...)",
+
+        # Plaintext digest.
+        f"local {V_CK4}=0x1357 local {V_CK5}=0x2468 local {V_CK6}=0x369C local {V_CK7}=0x4ACE",
+        f"for {V_I}=1,#{V_BYTE} do",
+        f"local {V_VALUE}={V_BYTE}[{V_I}]",
+        f"{V_CK4}=({V_CK4}*257+{V_VALUE}+{V_I})%65536",
+        f"{V_CK5}=({V_CK5}*263+{V_VALUE}*3+{V_I}*7)%65536",
+        f"{V_CK6}=({V_CK6}*269+{V_VALUE}*5+{V_I}*11)%65536",
+        f"{V_CK7}=({V_CK7}*271+{V_VALUE}*7+{V_I}*17)%65536",
+        "end",
+        f"if {V_CK4}~={V_IH1} or {V_CK5}~={V_IH2} or {V_CK6}~={V_IH3} or {V_CK7}~={V_IH4} then",
+        "error('Protected payload corrupted: plaintext integrity check failed')",
+        "end",
+
+        f"local {V_SUM}={{}}",
+        f"for {V_I}=1,#{V_BYTE} do {V_SUM}[{V_I}]={V_CHAR}({V_BYTE}[{V_I}]) end",
+        f"local {V_SOURCE}={V_CONCAT}({V_SUM})",
+        f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
+        f"if not {V_FN} then error('Internal Error: '..{V_TOSTRING}({V_ERR})) end",
+        f"return {V_FN}(...)",
         "end)(...)",
     ]
 
-    payload = lines[0] + "\n\n" + " ".join(x.strip() for x in lines[2:] if x.strip())
-
-    if minimum_size:
-        payload = _pad_lua_payload_to_minimum(payload)
+    payload = lines[0] + "\n\n" + " ".join(
+        x.strip() for x in lines[2:] if x.strip()
+    )
 
     if publish:
         try:
             _publish_local_payload(payload)
-        except Exception as exc:
-            print(f"[OBF] background publish failed (non-fatal): {exc}")
+        except Exception as _pub_exc:
+            print(f"[OBF] background publish failed (non-fatal): {_pub_exc}")
 
     return payload
 
