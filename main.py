@@ -6246,7 +6246,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         "local _B={} local _A=0",
         "for _I=1,#_D do",
         "local _V=_D[_I]",
-        "_V=(_V-_K[(_I+4-1)%8+1]-(_I*3))%256",
+        "_V=(_V-_K[(_I+4)%8+1]-(_I*3))%256",
         "_V=_X(_V,(_K[(_I+2-1)%8+1]+(_I*7))%256)",
         "_V=(_V-_K[(_I-1)%8+1]-(_I*13))%256",
         "_A=_A+1 _B[_A]=_V",
