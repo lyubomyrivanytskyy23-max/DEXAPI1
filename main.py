@@ -488,22 +488,64 @@ _JNK_B = [
     "Ref","Set","Get","Put","Del","Idx","Off","Sz","Cnt","Num","Len","Byte",
 ]
 
-def _junk_fenv_name(used: set) -> str:
+def _junk_fenv_name(used: set, _counter: list = [0]) -> str:
     """
     Generate a realistic-looking Lua variable name for a padding fenv local.
-    Combines two short semantic fragments (e.g. 'vm'+'Ctx' → '_vmCtx') and
-    appends a small optional digit so the space of unique names is enormous.
-    All produced names are registered in *used* to guarantee uniqueness.
+    O(1) guaranteed-unique: iterates the full cartesian product _JNK_A × _JNK_B
+    in a shuffled order, then falls back to a monotonically-increasing numeric
+    suffix so the pool is effectively infinite and no spin-loop is needed.
+
+    Strategy
+    --------
+    1. On first call, build a shuffled list of all (a, b) pairs and store it in
+       the closure-local `_counter` / `_pairs` state (attached as attributes on
+       this function object so they survive across calls with different `used`
+       sets — the counter resets per fresh obfuscation run via reset_junk_counter).
+    2. Pop the next pair, form "_aB"; if already in `used` (shouldn't happen in
+       normal use but guards against external collisions), append a suffix.
+    3. Once the cartesian product is exhausted, generate "_aB_<n>" with a global
+       counter — still O(1), still unique, still realistic-looking.
     """
-    while True:
-        a = _RNG.choice(_JNK_A)
-        b = _RNG.choice(_JNK_B)
-        # ~30 % chance of a trailing digit for extra variety
-        suffix = str(_RNG.randint(0, 9)) if _RNG.random() < 0.30 else ""
-        name = "_" + a + b + suffix
-        if name not in used:
-            used.add(name)
-            return name
+    # Lazily build + cache the shuffled pair list on the function object itself.
+    if not hasattr(_junk_fenv_name, "_pairs"):
+        pairs = [(a, b) for a in _JNK_A for b in _JNK_B]
+        _RNG.shuffle(pairs)
+        _junk_fenv_name._pairs = pairs
+        _junk_fenv_name._pos   = 0
+        _junk_fenv_name._seq   = 0          # overflow counter
+
+    pos   = _junk_fenv_name._pos
+    pairs = _junk_fenv_name._pairs
+
+    if pos < len(pairs):
+        a, b = pairs[pos]
+        _junk_fenv_name._pos += 1
+        name = "_" + a + b
+        # Guard against external collisions (e.g. real variable used same name).
+        if name in used:
+            _junk_fenv_name._seq += 1
+            name = f"_{a}{b}_{_junk_fenv_name._seq}"
+    else:
+        # Cartesian product exhausted — use a monotonic suffix; always unique.
+        _junk_fenv_name._seq += 1
+        n   = _junk_fenv_name._seq
+        a   = _JNK_A[n % len(_JNK_A)]
+        b   = _JNK_B[n % len(_JNK_B)]
+        name = f"_{a}{b}_{n}"
+
+    used.add(name)
+    return name
+
+
+def _reset_junk_fenv_counter() -> None:
+    """
+    Call at the start of each obfuscation run to reset the name-generator state
+    so every script gets its own fresh, shuffled sequence rather than continuing
+    from where the last run left off.
+    """
+    for attr in ("_pairs", "_pos", "_seq"):
+        if hasattr(_junk_fenv_name, attr):
+            delattr(_junk_fenv_name, attr)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -5769,7 +5811,7 @@ def _build_loadstring(raw_url):
     return "loadstring(game:HttpGet(" + json.dumps(raw_url) + "))()"
 
 
-def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -> str:
+def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, target_bytes: int = 0) -> str:
     """
     Compact compatibility-oriented Lua protection wrapper.
 
@@ -5822,6 +5864,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     encoded_length = len(encoded)
 
     used = set()
+    _reset_junk_fenv_counter()          # O(1) name-gen: fresh shuffled sequence per run
     N = lambda: _unique_name(used)
 
     V_TYPE = N()
@@ -5965,12 +6008,20 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     comment_line = lines[0]
     code_line    = " ".join(x.strip() for x in lines[2:] if x.strip())
 
-    # Size-scaling rule: 1 KB per source line
+    # Size-scaling rule: 1 KB per source line of the ORIGINAL user script.
     #   500 lines → 500 KB  |  1 000 → 1 MB  |  2 000 → 2 MB  |  3 000 → 3 MB
-    num_src_lines  = max(1, len(source.splitlines()))
-    target_bytes   = num_src_lines * 1024                     # bytes for the whole output
-    overhead       = len(comment_line.encode("utf-8")) + 2    # \n\n
-    needed_code    = target_bytes - overhead                  # bytes line 3 must reach
+    #
+    # When the caller passes target_bytes > 0 (the API pipeline does this so the
+    # DEX wrapper is sized against the real script even though only the short
+    # intermediate loadstring is encrypted), use that value directly.
+    # Otherwise auto-compute from whatever source was passed in.
+    if target_bytes and target_bytes > 0:
+        _target = int(target_bytes)
+    else:
+        num_src_lines = max(1, len(source.splitlines()))
+        _target       = num_src_lines * 1024
+    overhead    = len(comment_line.encode("utf-8")) + 2   # \n\n
+    needed_code = _target - overhead                      # bytes line 3 must reach
 
     current_code_bytes = len(code_line.encode("utf-8"))
     if current_code_bytes < needed_code:
@@ -6428,12 +6479,20 @@ async def obfuscate_api(request: Request):
         # Feed only the short loadstring into the DEX wrapper cipher.  The
         # output is a compact self-decoding Lua blob that, when run, fetches
         # and executes the Goofyscator-protected original script.
+        #
+        # We pass target_bytes derived from the ORIGINAL source line count so
+        # the DEX layer is padded to the correct final size even though only the
+        # short intermediate loadstring is actually encrypted inside it.
+        # Rule: 1 KB per original source line  (500 lines → 500 KB, etc.)
+        _orig_lines    = max(1, len(source.splitlines()))
+        _dex_target_bytes = _orig_lines * 1024
         dex_obfuscated = await asyncio.to_thread(
             obfuscate_lua,
             intermediate_source,  # tiny loadstring, not the full goofy payload
             False,                 # publish=False — we publish it ourselves below
             "hard",                # maximum cipher rounds / smallest block sizes
-            False,                 # minimum_size=False — no extra padding
+            False,                 # minimum_size=False
+            _dex_target_bytes,     # size target from original source line count
         )
 
         if not dex_obfuscated or not dex_obfuscated.strip():
