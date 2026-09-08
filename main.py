@@ -6050,8 +6050,11 @@ def _dex_encoder_wrap(source: str) -> str:
         inner = junk_str + "\n" + inner
 
     # ── Assemble 3-line output ────────────────────────────────────────────────
+    # Keep the return(...) wrapper on a single line so linters (e.g. Nexomia)
+    # don't flag line 3 as an incomplete statement.
     header = "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]"
-    code_line = "return(function(...)\n" + inner + "\nend)(...)"
+    inner_single = inner.replace("\n", " ")
+    code_line = "return(function(...) " + inner_single + " end)(...)"
 
     return header + "\n\n" + code_line
 
