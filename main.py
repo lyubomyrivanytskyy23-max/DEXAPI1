@@ -6235,7 +6235,7 @@ textarea.code::placeholder{color:#333}
       </div>
     </div>
     <div class="editor-wrap">
-      <textarea id="source" class="code" spellcheck="false" placeholder="-- Welcome to Goofyscator&#10;print('Hello World')"></textarea>
+      <textarea id="source" class="code" spellcheck="false" placeholder="-- Welcome to Dexfuscator&#10;print('Hello World')"></textarea>
     </div>
   </div>
 
