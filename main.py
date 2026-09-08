@@ -5772,7 +5772,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     encoded = encrypted.hex()
 
     lines = [
-        "-- This file was protected using Dex Obfustucator v5.9 Compact [.gg/dexfinder]",
+        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
         f"local {V_TYPE}=type",
