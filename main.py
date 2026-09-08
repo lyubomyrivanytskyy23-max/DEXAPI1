@@ -6042,7 +6042,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         while pad_bytes < deficit:
             for _ in range(BATCH):
                 n    = _junk_fenv_name(used)
-                frag = f"local {n}=getfenv()"
+                # getfenv() is Lua 5.1-only and nil in Roblox Luau — calling it
+                # raises "attempt to call a nil value".  Use a math expression
+                # that is always valid, evaluates to a constant, and is just as
+                # opaque to a casual reader.
+                frag = f"local {n}=({_RNG.randint(1,0xFFFF)}*{_RNG.randint(1,0xFFFF)})%{_RNG.randint(1,0xFFFF)+1}"
                 pad_parts.append(frag)
                 pad_bytes += len(frag) + 1
                 if pad_bytes >= deficit:
