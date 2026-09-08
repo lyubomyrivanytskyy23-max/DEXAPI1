@@ -6114,30 +6114,39 @@ def _call_dex_obfuscator_v8(source: str, settings: dict) -> str:
     )
 
 
-def _clean_goofyscator_output(protected: str) -> str:
-    """Normalize the upstream result and remove Goofyscator branding."""
-    protected = str(protected or "").replace("\ufeff", "")
-    protected = protected.replace("\r\n", "\n").replace("\r", "\n").strip()
+def _strip_goofyscator_header(protected: str) -> str:
+    """
+    Strip the Goofyscator V10 BETA-2.1 branding comment from the first line
+    of the returned payload (and any leading blank lines after it), then
+    return the clean obfuscated Lua body.
 
-    # Remove the known Goofyscator banner without adding another banner.
-    branding_lines = {
-        "-- This file is protected by goofyscator V10 BETA-2.1 >> goofyscator.lua.cz <<",
-    }
-    lines = [
-        line for line in protected.split("\n")
-        if line.strip() not in branding_lines
-    ]
-    protected = "\n".join(lines).strip()
+    Only the exact header comment is removed — the rest of the payload is
+    returned verbatim so no bytes of the actual obfuscated code are touched.
+    """
+    protected = str(protected or "").replace("\ufeff", "")
+    protected = protected.replace("\r\n", "\n").replace("\r", "\n")
+
+    GOOFY_HEADER = "-- This file is protected by goofyscator V10 BETA-2.1 >> goofyscator.lua.cz <<"
+
+    # Strip the exact header line whether it appears at position 0 or after a BOM.
+    if protected.startswith(GOOFY_HEADER):
+        protected = protected[len(GOOFY_HEADER):]
+
+    # Also handle it embedded anywhere on a standalone comment line (edge case
+    # where the upstream adds it mid-payload or with extra whitespace).
+    protected = re.sub(
+        r"^[ \t]*--[ \t]*This file is protected by goofyscator V10 BETA-2\.1.*\r?\n?",
+        "",
+        protected,
+        flags=re.MULTILINE,
+    )
+
+    protected = protected.strip()
 
     if not protected:
-        raise ValueError("Goofyscator returned an empty payload.")
+        raise ValueError("Goofyscator returned an empty payload after header removal.")
 
     return protected
-
-
-def _format_dex_obfuscator_payload(protected: str) -> str:
-    """Backward-compatible formatter that strips Goofyscator branding."""
-    return _clean_goofyscator_output(protected)
 
 
 @app.get("/obfuscate")
@@ -6149,9 +6158,10 @@ async def obfuscate_page():
 async def obfuscate_api(request: Request):
     """Public DEX Obfuscator V8 API proxy.
 
-    The website POSTs Lua source here. The pipeline keeps the upstream
-    Goofyscator result compact, removes its branding line, publishes it at a
-    raw URL, then sends only the resulting loadstring through DEX.
+    The website POSTs the Lua source here. This route now sends a real JSON
+    POST directly to the DEX Obfuscator V8 upstream API instead of creating
+    or waiting on a `.goofy` bridge job. The upstream `result` is then wrapped
+    with the DEX header and spacing used by the website.
     """
     ip = _client_ip(request)
     if rate_limited(ip, "obfustucate", OBF_RATE_LIMIT, OBF_RATE_WINDOW):
@@ -6185,55 +6195,67 @@ async def obfuscate_api(request: Request):
 
     try:
         # ── Step 1: Goofyscator (DEX Obfuscator V8 upstream) ────────────────
-        # Sends the raw Lua source to the upstream Goofyscator API and gets
-        # back an obfuscated Lua string.
+        # Send the raw Lua source to the upstream Goofyscator API and get back
+        # an obfuscated Lua string.
         protected = await asyncio.to_thread(
             _call_dex_obfuscator_v8,
             source,
             settings,
         )
 
-        # ── Step 2: Clean the Goofyscator result ──────────────────────────────
-        # Keep the upstream Lua intact except for its branding line. This
-        # removes the old custom XOR/hex wrapper and keeps the hosted payload
-        # substantially smaller.
-        goofy_payload = _clean_goofyscator_output(protected)
+        # ── Step 2: Strip Goofyscator header ────────────────────────────────
+        # Remove the "-- This file is protected by goofyscator …" first line
+        # so it never appears in any output or hosted payload.
+        goofy_clean = _strip_goofyscator_header(protected)
 
-        # ── Step 3: Publish the cleaned upstream Lua ──────────────────────────
+        # ── Step 3: Publish clean Goofyscator output to our raw store ───────
+        # Store the stripped goofyscated Lua under its own loader ID.  The
+        # heavy obfuscated blob lives here; nothing else in the pipeline ever
+        # transfers it over the wire again — only the tiny URL does.
         try:
-            upstream_raw_url, upstream_loader_id = _publish_local_payload(goofy_payload)
+            goofy_raw_url, goofy_loader_id = _publish_local_payload(goofy_clean)
         except Exception as pub_exc:
-            print(f"[DEX_OBF_PIPELINE] upstream raw publish failed: {pub_exc}")
+            print(f"[DEX_OBF_PIPELINE] goofy raw publish failed: {pub_exc}")
             raise RuntimeError(
                 "Could not publish the Goofyscator payload to the raw loader store."
             ) from pub_exc
 
-        # ── Step 4: Build a small loader for the upstream raw URL ─────────────
-        upstream_loadstring = _build_loadstring(upstream_raw_url)
+        # ── Step 4: Build an intermediate loadstring that fetches the goofy raw
+        # This is the *source* that the DEX obfuscator will protect.  It is a
+        # single compact line — the entire goofyscated blob never appears in the
+        # DEX output at all, which keeps the final payload tiny.
+        intermediate_loadstring = _build_loadstring(goofy_raw_url)
+        # Wrap it so it self-executes when the DEX layer decodes it:
+        # the DEX wrapper decodes → runs this one-liner → which in turn fetches
+        # and executes the full goofyscated script.
+        intermediate_source = intermediate_loadstring  # already self-executing
 
-        # ── Step 5: Obfuscate only that loader with DEX ────────────────────────
-        # The second pass receives the short loader instead of the entire
-        # Goofyscator payload, reducing the amount of generated wrapper data.
-        dex_loader = await asyncio.to_thread(
-            _call_dex_obfuscator_v8,
-            upstream_loadstring,
-            settings,
+        # ── Step 5: DEX-obfuscate the loadstring ────────────────────────────
+        # Feed only the short loadstring into the DEX wrapper cipher.  The
+        # output is a compact self-decoding Lua blob that, when run, fetches
+        # and executes the Goofyscator-protected original script.
+        dex_obfuscated = await asyncio.to_thread(
+            obfuscate_lua,
+            intermediate_source,  # tiny loadstring, not the full goofy payload
+            False,                 # publish=False — we publish it ourselves below
+            "hard",                # maximum cipher rounds / smallest block sizes
+            False,                 # minimum_size=False — no extra padding
         )
-        dex_loader = _clean_goofyscator_output(dex_loader)
 
-        if not dex_loader or not dex_loader.strip():
-            raise RuntimeError("DEX obfuscator returned an empty loader payload.")
+        if not dex_obfuscated or not dex_obfuscated.strip():
+            raise RuntimeError("DEX obfuscator returned an empty payload.")
 
-        # ── Step 6: Publish the DEX-obfuscated loader ─────────────────────────
+        # ── Step 6: Publish DEX-obfuscated wrapper to the raw store ─────────
+        # This is the URL that end-users actually copy.  It points to a tiny
+        # DEX blob (~2–4 KB) instead of the full goofyscated script.
         try:
-            raw_url, loader_id = _publish_local_payload(dex_loader)
+            raw_url, loader_id = _publish_local_payload(dex_obfuscated)
         except Exception as pub_exc:
-            print(f"[DEX_OBF_PIPELINE] final raw publish failed: {pub_exc}")
+            print(f"[DEX_OBF_PIPELINE] dex raw publish failed: {pub_exc}")
             raise RuntimeError(
-                "Could not publish the DEX-obfuscated loader."
+                "Could not publish the DEX-obfuscated payload to the raw loader store."
             ) from pub_exc
 
-        # The user/executor loads only this short final expression.
         final_loadstring = _build_loadstring(raw_url)
 
         # Record the submission in the admin history log.
@@ -6248,15 +6270,19 @@ async def obfuscate_api(request: Request):
             {
                 "ok": True,
                 "status": "success",
-                # `payload` is what the UI shows in the output box —
-                # the final self-executing loadstring, not the raw bytes.
+                # `payload` / `loadstring` — what the UI shows and the user copies.
+                # Points to the tiny DEX wrapper, not the raw goofyscated blob.
                 "payload": final_loadstring,
-                # `result` carries the final DEX-obfuscated loader text.
-                "result": dex_loader,
-                # Convenience fields for the front-end copy controls.
                 "loadstring": final_loadstring,
+                # `result` — the DEX-obfuscated Lua text (the wrapper layer).
+                # Callers that want the raw protected script can use this.
+                "result": dex_obfuscated,
+                # Raw URL of the DEX wrapper (the tiny public-facing endpoint).
                 "raw_url": raw_url,
                 "loader_id": loader_id,
+                # Goofyscator raw URL kept for admin/debugging only — not
+                # exposed to the browser UI.
+                "goofy_raw_url": goofy_raw_url,
                 "settings": settings,
             }
         )
