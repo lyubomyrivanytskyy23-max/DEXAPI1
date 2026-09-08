@@ -6205,7 +6205,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     token_encoded = _encode_binary_tokens(enc, tok0, tok1)
 
     # ── fragment shuffle ─────────────────────────────────────────────────────
-    frag_min, frag_max = cfg["fragment"], cfg["fragment"]
+    frag_min, frag_max = cfg["fragment"]
     indexed_frags = _fragment_tokens(token_encoded, frag_min, frag_max)
 
     # ── unique name factory ──────────────────────────────────────────────────
@@ -6452,7 +6452,10 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     payload = lines[0] + "\n\n" + " ".join(x.strip() for x in lines[2:] if x.strip())
 
     if publish:
-        _raw_backend_publish(payload)
+        try:
+            _publish_local_payload(payload)
+        except Exception as _pub_exc:
+            print(f"[OBF] background publish failed (non-fatal): {_pub_exc}")
 
     return payload
 
