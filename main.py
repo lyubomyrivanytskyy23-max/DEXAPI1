@@ -6432,7 +6432,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"{V_CK7}=({V_CK7}*271+{V_VALUE}*7+{V_I}*17)%65536",
         "end",
         f"if {V_CK4}~={V_IH1} or {V_CK5}~={V_IH2} or {V_CK6}~={V_IH3} or {V_CK7}~={V_IH4} then",
-        "if warn then warn('[DEX] Anti-tamper check failed: protected payload was modified.') end",
+        "if warn then warn('[DEX] Tamper Detected No Source For You :D [.gg/dexfinder]') end",
         "error('Protected payload integrity check failed')",
         "end",
 
