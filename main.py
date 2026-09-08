@@ -5927,34 +5927,93 @@ def _target_dex_size_from_source_lines(source: str) -> int:
 
 
 def _pad_lua_payload_to_size(payload: str, target_bytes: int) -> str:
-    """Pad only with inert Lua comments so runtime behavior remains unchanged."""
+    """
+    Grow the final DEX artifact with syntactically valid Lua/Luau code rather
+    than an obvious wall of `x` characters.
+
+    The generated code is deliberately unreachable: each chunk defines a
+    uniquely named local function and never invokes it.  That gives the output
+    real Lua syntax/structure without adding meaningful execution work or
+    depending on version-specific helpers such as getfenv/setfenv.
+
+    The target is still approximately 1 KiB per original source line, as
+    controlled by _target_dex_size_from_source_lines().
+    """
     payload = str(payload or "")
     target_bytes = max(0, int(target_bytes))
     current = len(payload.encode("utf-8"))
     if current >= target_bytes:
         return payload
 
-    marker = "-- END"
-    chunk = "x" * 900
     parts = [payload.rstrip("\n")]
+    current = len("\n".join(parts).encode("utf-8"))
     remaining = target_bytes - current
 
-    while remaining > 0:
-        line = marker + chunk
-        line_bytes = len(("\n" + line).encode("utf-8"))
-        if line_bytes <= remaining:
-            parts.append(line)
-            remaining -= line_bytes
-            continue
+    # Real, portable Lua/Luau filler.  Nothing is called, so the filler has
+    # effectively zero runtime cost after parsing.
+    body_templates = (
+        "local a=({1,2,3,4,5}) local b=0 for i=1,#a do b=b+a[i] end",
+        "local t={alpha=1,beta=2,gamma=3} local q=t.alpha+t.beta+t.gamma",
+        "local s='dex' local n=#s local r=s:sub(1,n)",
+        "local x=17 local y=29 local z=((x*y)-y+x)-x",
+        "local ok,v=pcall(function() return type(123)=='number' end)",
+        "local m={1,4,9,16} local total=0 for i=1,#m do total=total+m[i] end",
+        "local k='payload' local c=0 for i=1,#k do c=c+string.byte(k,i) end",
+        "local u=0 for i=1,8 do u=(u*33+i)%65536 end",
+        "local a,b=3,7 local c=(a+b)*(b-a) local d=c-(b*b-a*a)",
+        "local t={} t.one=1 t.two=2 t.three=3 local q=t.one+t.two+t.three",
+    )
 
-        usable = max(0, remaining - len(("\n" + marker).encode("utf-8")))
-        if usable <= 0:
+    def make_chunk(index: int) -> str:
+        name = "_dexpad_" + _rand_name(10) + "_" + str(index)
+        body = body_templates[index % len(body_templates)]
+        # A local function declaration is valid in Lua 5.x/Luau and is never
+        # invoked.  The surrounding do/end keeps every generated symbol local.
+        return f"do local function {name}() {body} return {index % 97} end end"
+
+    index = 0
+
+    # Add complete code chunks while they fit.  A small safety margin avoids
+    # producing a truncated Lua statement.
+    while remaining >= 64:
+        chunk = make_chunk(index)
+        candidate = "\n" + chunk
+        size = len(candidate.encode("utf-8"))
+        if size > remaining:
             break
-        parts.append(marker + ("x" * usable))
-        remaining = 0
+        parts.append(chunk)
+        remaining -= size
+        index += 1
 
-    return "\n".join(parts)
+    # If only a small tail remains, use a compact valid function declaration
+    # whose identifier is length-adjusted to consume as much of the target as
+    # possible.  We never emit a synthetic X-filled comment.
+    if remaining > 0:
+        prefix = "\ndo local function "
+        suffix = "() end end"
+        fixed = len((prefix + suffix).encode("utf-8"))
+        if remaining >= fixed + 1:
+            name_len = remaining - fixed
+            name_len = max(1, name_len)
+            tail_name = "p" * name_len
+            tail = prefix + tail_name + suffix
+            tail_size = len(tail.encode("utf-8"))
+            if tail_size <= remaining:
+                parts.append(tail.lstrip("\n"))
+                remaining -= tail_size
 
+    # Finish to the exact byte target with harmless Lua whitespace only when
+    # the remaining space is too small for another complete statement.
+    result = "\n".join(parts)
+    result_bytes = len(result.encode("utf-8"))
+    if result_bytes < target_bytes:
+        result += " " * (target_bytes - result_bytes)
+    elif result_bytes > target_bytes:
+        # This should not occur because every chunk is checked before append,
+        # but keep the helper defensive if its sizing logic is changed later.
+        result = result.encode("utf-8")[:target_bytes].decode("utf-8", errors="ignore")
+
+    return result
 
 def _pad_lua_payload_to_minimum(payload):
     """Legacy compatibility helper."""
