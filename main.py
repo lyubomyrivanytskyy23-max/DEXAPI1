@@ -6264,7 +6264,19 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # Checksums over raw bytecode integer values
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
-        f"{V_SUM_C}=(bit32.bxor({V_SUM_C},{V_VALUE})*16777619)%4294967296",
+        # FNV-1a multiply split into 16-bit pieces.  A direct
+        #   (u32 * 16777619) % 4294967296
+        # can lose integer precision in Luau/Lua-number runtimes because the
+        # intermediate product is larger than the exactly-representable range.
+        # Keeping the multiply below 2^53 makes the checksum portable across
+        # normal executors while preserving the exact 32-bit FNV result.
+        f"local {V_TMP}=bit32.bxor({V_SUM_C},{V_VALUE})",
+        f"local {V_A}={V_TMP}%65536",
+        f"local {V_B}=({V_TMP}-{V_A})/65536",
+        f"local {V_C_}=({V_A}*403)%65536",
+        f"local {V_TMP}=math.floor(({V_A}*403)/65536)",
+        f"{V_TMP}=({V_B}*403+{V_A}+{V_TMP})%65536",
+        f"{V_SUM_C}={V_TMP}*65536+{V_C_}",
         "end",
 
         # Layer 10: verify plaintext checksums
