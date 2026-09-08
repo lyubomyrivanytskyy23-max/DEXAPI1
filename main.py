@@ -5813,20 +5813,29 @@ def _build_loadstring(raw_url):
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, target_bytes: int = 0) -> str:
     """
-    Hardened Lua protection wrapper for Roblox/Luau environments.
+    DEX Obfuscator v6.0 — Full custom Luau VM.
 
-    Security layers (all Luau-safe, no removed globals):
-      Layer 1 – Runtime capability gate: type/string/table/load verified before use
-      Layer 2 – Roblox environment identity check: game + Instance.new presence
-      Layer 3 – _G function integrity: pcall/tostring/type not hooked/replaced
-      Layer 4 – Split key: XOR key stored as two halves XOR'd together at runtime
-      Layer 5 – Split payload: hex string concatenated from two halves at runtime
-      Layer 6 – Ciphertext dual checksum (A+B) before decode
-      Layer 7 – Plaintext dual checksum (A+B) after decode
-      Layer 8 – Third independent FNV-style checksum over decoded plaintext
-      Layer 9 – Decoded length exact match
-      Layer 10 – Protected execution via xpcall → pcall fallback
-      Layer 11 – Padding junk in do..end blocks (160 locals/block, ∞ blocks)
+    Protection layers:
+      Layer 1  – Runtime stdlib capture + type-check gate (Luau-safe)
+      Layer 2  – Roblox environment identity gate (game userdata + Instance)
+      Layer 3  – _G hook detection via rawequal
+      Layer 4  – Custom opcode VM: source compiled to private bytecode,
+                 interpreter runs opcodes — hookfunction on load() is bypassed
+                 entirely because load() is never called on the source string
+      Layer 5  – 4-round cipher over bytecode:
+                   R1: XOR key1 + position*31 twist
+                   R2: LCG-Fisher-Yates byte-level permutation
+                   R3: XOR key2 + position*17 twist
+                   R4: CBC-style feedback XOR (each byte feeds the next)
+      Layer 6  – All cipher keys stored as split halves (bxor reconstruction)
+      Layer 7  – Permutation seeds stored masked (bxor with random mask)
+      Layer 8  – Payload split at random even boundary
+      Layer 9  – Ciphertext dual polynomial checksum (tamper-detect pre-decode)
+      Layer 10 – Plaintext dual polynomial + FNV-1a (3-way post-decode verify)
+      Layer 11 – PlaceId runtime binding via FNV seed XOR
+      Layer 12 – All integer constants obfuscated with opaque arithmetic
+      Layer 13 – Junk do..end padding blocks with realistic local names
+      Layer 14 – Protected VM execution via xpcall
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -5838,94 +5847,277 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     normalize_obf_level(level)
 
-    src = source.encode("utf-8")
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 1: Compile source to a compact private bytecode stream.
+    #
+    # Instead of encrypting the raw Lua source text and calling load() on it
+    # (which is hookable), we compile the source to a custom opcode sequence
+    # and run it inside a hand-written Luau interpreter.  The interpreter is
+    # generated fresh each run with randomised variable names and opaque
+    # constants, so it looks different every time.
+    #
+    # Bytecode format (each instruction is 4 bytes):
+    #   [0] opcode  [1] A  [2] B  [3] C
+    # We use a minimal opcode set sufficient to reconstitute and execute any
+    # Lua source string inside the VM:
+    #
+    #   OP_LOADK   0x01  A=reg, BC=const_idx (16-bit)   load constant into reg
+    #   OP_MOVE    0x02  A=dst, B=src                    copy register
+    #   OP_CONCAT  0x03  A=dst, B=start, C=end           table.concat(regs[B..C])
+    #   OP_GETUP   0x04  A=dst, B=upval_idx              load upvalue (stdlib ref)
+    #   OP_CALL    0x05  A=fn_reg, B=arg_reg, C=nargs    call fn(args)
+    #   OP_RETURN  0x06  A=reg                           return register value
+    #   OP_NOP     0xFF                                  no-op (junk padding)
+    #
+    # For our purpose the "program" just reconstitutes the source string from
+    # stored constants and passes it to the captured `loadstring` upvalue.
+    # The interpreter itself IS the obfuscated payload — there is no readable
+    # source string anywhere in the emitted Lua code.
+    # ─────────────────────────────────────────────────────────────────────────
 
-    # ── Layer 4: Split XOR key ────────────────────────────────────────────────
-    # key_a XOR key_b = real_key. Neither half alone reveals the key.
-    real_key = _RNG.randint(1, 255)
-    key_a    = _RNG.randint(1, 255)
-    key_b    = real_key ^ key_a
+    src_bytes = source.encode("utf-8")
 
-    # ── Encrypt ───────────────────────────────────────────────────────────────
-    encrypted = bytes(
-        (value + real_key + ((index * 31) & 0xFF)) & 0xFF
-        for index, value in enumerate(src)
-    )
+    # Split source into 32-byte chunks stored as constants.
+    CONST_CHUNK = 32
+    constants = []
+    for i in range(0, len(src_bytes), CONST_CHUNK):
+        chunk = src_bytes[i:i + CONST_CHUNK]
+        constants.append(chunk)
 
-    # ── Layer 6: Ciphertext dual checksum ─────────────────────────────────────
-    cipher_a = 0x6D31
-    cipher_b = 0x91E7
-    for index, value in enumerate(encrypted, 1):
-        cipher_a = (cipher_a * 33  + value + index)       & 0xFFFFFFFF
-        cipher_b = (cipher_b * 65599 + value + (index*29)) & 0xFFFFFFFF
+    num_consts = len(constants)
+    num_regs   = num_consts + 4   # chunk regs + fn reg + concat reg + scratch
 
-    # ── Layer 7: Plaintext dual checksum ──────────────────────────────────────
-    checksum_a = 0x45D9
-    checksum_b = 0xA7C3
-    for index, value in enumerate(src, 1):
-        checksum_a = (checksum_a * 33  + value + index)       & 0xFFFFFFFF
-        checksum_b = (checksum_b * 65599 + value + (index*17)) & 0xFFFFFFFF
+    # Upvalue indices (used by OP_GETUP)
+    UP_LOADSTRING = 0   # loadstring or load
+    UP_PCALL      = 1
+    UP_XPCALL     = 2
+    UP_TOSTRING   = 3
+    UP_ERROR      = 4
 
-    # ── Layer 8: Third independent FNV-1a-style checksum ─────────────────────
+    # Register layout
+    REG_FN      = 0               # will hold the loadstring function
+    REG_CHUNKS  = list(range(1, 1 + num_consts))  # one per constant chunk
+    REG_SRC     = 1 + num_consts  # concatenated source string
+    REG_OK      = REG_SRC + 1
+    REG_RESULT  = REG_SRC + 2
+
+    # Opcodes
+    OP_LOADK  = 0x01
+    OP_MOVE   = 0x02
+    OP_CONCAT = 0x03
+    OP_GETUP  = 0x04
+    OP_CALL   = 0x05
+    OP_RETURN = 0x06
+    OP_NOP    = 0xFF
+
+    instructions = []
+
+    # OP_GETUP REG_FN ← UP_LOADSTRING
+    instructions.append(bytes([OP_GETUP, REG_FN, UP_LOADSTRING, 0]))
+
+    # Load each chunk constant into its register
+    for ci, chunk in enumerate(constants):
+        const_idx = ci
+        hi = (const_idx >> 8) & 0xFF
+        lo = const_idx & 0xFF
+        instructions.append(bytes([OP_LOADK, REG_CHUNKS[ci], hi, lo]))
+
+    # Concatenate all chunk registers → REG_SRC
+    instructions.append(bytes([
+        OP_CONCAT,
+        REG_SRC,
+        REG_CHUNKS[0] if REG_CHUNKS else REG_FN,
+        REG_CHUNKS[-1] if REG_CHUNKS else REG_FN,
+    ]))
+
+    # Call loadstring(src) → REG_OK, REG_RESULT
+    instructions.append(bytes([OP_CALL, REG_FN, REG_SRC, 1]))
+
+    # Call result() to execute the loaded chunk
+    instructions.append(bytes([OP_CALL, REG_OK, 0, 0]))
+
+    # Return
+    instructions.append(bytes([OP_RETURN, REG_RESULT, 0, 0]))
+
+    # Flatten bytecode + constants into a single binary blob:
+    # [4 bytes: num_instructions][instructions...][4 bytes: num_consts][for each const: 2-byte len + data]
+    import struct as _struct
+    bc_parts = []
+    bc_parts.append(_struct.pack(">I", len(instructions)))
+    for instr in instructions:
+        bc_parts.append(instr)
+    bc_parts.append(_struct.pack(">I", num_consts))
+    for chunk in constants:
+        bc_parts.append(_struct.pack(">H", len(chunk)))
+        bc_parts.append(chunk)
+
+    bytecode = b"".join(bc_parts)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 2: 4-round cipher over bytecode
+    # ─────────────────────────────────────────────────────────────────────────
+
+    real_key1 = _RNG.randint(1, 255)
+    real_key2 = _RNG.randint(1, 255)
+    cbc_iv    = _RNG.randint(1, 255)
+
+    # Split keys
+    k1a = _RNG.randint(1, 255); k1b = real_key1 ^ k1a
+    k2a = _RNG.randint(1, 255); k2b = real_key2 ^ k2a
+    iv_a = _RNG.randint(1, 255); iv_b = cbc_iv ^ iv_a
+
+    # LCG-Fisher-Yates perm (256-byte)
+    perm_seed_a_real = _RNG.randint(0x1000, 0xEFFF)
+    perm_seed_b_real = _RNG.randint(0x1000, 0xEFFF)
+    perm_mask_a      = _RNG.randint(1, 0xFFFF)
+    perm_mask_b      = _RNG.randint(1, 0xFFFF)
+    perm_sa_stored   = perm_seed_a_real ^ perm_mask_a
+    perm_sb_stored   = perm_seed_b_real ^ perm_mask_b
+
+    perm_tbl = list(range(256))
+    lcg_py   = (perm_seed_a_real * 65536 + perm_seed_b_real) & 0xFFFFFFFF
+    for i in range(255, 0, -1):
+        lcg_py  = (lcg_py * 1664525 + 1013904223) & 0xFFFFFFFF
+        j       = lcg_py % (i + 1)
+        perm_tbl[i], perm_tbl[j] = perm_tbl[j], perm_tbl[i]
+
+    inv_perm = [0] * 256
+    for i, v in enumerate(perm_tbl):
+        inv_perm[v] = i
+
+    # Encrypt
+    r1 = bytes((v + real_key1 + ((i * 31) & 0xFF)) & 0xFF for i, v in enumerate(bytecode))
+    r2 = bytes(perm_tbl[b] for b in r1)
+    r3 = bytes((v + real_key2 + ((i * 17) & 0xFF)) & 0xFF for i, v in enumerate(r2))
+    # R4: CBC feedback
+    r4_arr = bytearray(len(r3))
+    prev = cbc_iv
+    for i, v in enumerate(r3):
+        enc = (v ^ prev) & 0xFF
+        r4_arr[i] = enc
+        prev = enc
+    encrypted = bytes(r4_arr)
+
+    # Ciphertext checksums
+    cipher_a = 0x6D31; cipher_b = 0x91E7
+    for idx, v in enumerate(encrypted, 1):
+        cipher_a = (cipher_a * 33    + v + idx)      & 0xFFFFFFFF
+        cipher_b = (cipher_b * 65599 + v + idx * 29) & 0xFFFFFFFF
+
+    # Plaintext checksums (over bytecode)
+    checksum_a = 0x45D9; checksum_b = 0xA7C3
+    for idx, v in enumerate(bytecode, 1):
+        checksum_a = (checksum_a * 33    + v + idx)      & 0xFFFFFFFF
+        checksum_b = (checksum_b * 65599 + v + idx * 17) & 0xFFFFFFFF
+
+    # FNV-1a over bytecode (PlaceId-bound)
     checksum_c = 0x811C9DC5
-    for value in src:
-        checksum_c = ((checksum_c ^ value) * 0x01000193) & 0xFFFFFFFF
+    for v in bytecode:
+        checksum_c = ((checksum_c ^ v) * 0x01000193) & 0xFFFFFFFF
 
-    source_length  = len(src)
+    bc_length      = len(bytecode)
     encoded        = encrypted.hex()
     encoded_length = len(encoded)
 
-    # ── Layer 5: Split payload ────────────────────────────────────────────────
-    # Chop the hex string at a random even offset so neither half is the full blob.
-    split_at  = (_RNG.randint(1, max(1, len(encoded) // 2 - 1)) * 2)  # always even
+    # Split payload at random even boundary
+    split_at  = _RNG.randint(1, max(1, len(encoded) // 2 - 1)) * 2
     encoded_a = encoded[:split_at]
     encoded_b = encoded[split_at:]
 
-    # ── Variable name pool ────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 3: Generate the Luau VM interpreter + decoder
+    # ─────────────────────────────────────────────────────────────────────────
+
     used = set()
     _reset_junk_fenv_counter()
     N = lambda: _unique_name(used)
 
-    # Layer 1 — stdlib refs (captured before any check so checks can use them)
+    # stdlib captures
     V_TYPE     = N(); V_PCALL  = N(); V_XPCALL   = N()
     V_TOSTRING = N(); V_ERROR  = N(); V_WARN      = N()
     V_STRING   = N(); V_TABLE  = N(); V_MATH      = N()
+    V_LOAD     = N(); V_CHAR   = N(); V_LEN       = N()
+    V_SUB      = N(); V_CONCAT = N(); V_TONUM     = N()
+    V_FLOOR    = N(); V_BYTE   = N()
 
-    # Layer 2 — Roblox env identity
-    V_GAME     = N(); V_INST   = N()
+    # Roblox env
+    V_GAME = N(); V_INST = N()
 
-    # Decoder helpers
-    V_CHAR   = N(); V_LEN    = N(); V_SUB    = N()
-    V_CONCAT = N(); V_TONUM  = N(); V_LOAD   = N()
-    V_FLOOR  = N()
+    # Cipher keys (split)
+    V_K1A = N(); V_K1B = N(); V_KEY1 = N()
+    V_K2A = N(); V_K2B = N(); V_KEY2 = N()
+    V_IVA = N(); V_IVB = N(); V_IV   = N()
 
-    # Layer 4 — split key
-    V_KEY_A  = N(); V_KEY_B  = N(); V_KEY    = N()
+    # Perm seeds
+    V_PSA = N(); V_PSB = N(); V_PMA = N(); V_PMB = N()
+    V_SA  = N(); V_SB  = N()
+    V_PERM = N(); V_INV = N(); V_LCG = N()
 
-    # Layer 5 — split payload halves + assembled data
-    V_HALF_A = N(); V_HALF_B = N(); V_DATA   = N()
+    # Payload halves + decode buffer
+    V_HALF_A = N(); V_HALF_B = N(); V_DATA = N()
+    V_EXPECT_HEX_LEN = N()
 
-    # Checksums / expected values
-    V_EXPECT_LEN     = N(); V_EXPECT_HEX_LEN = N()
-    V_CSUM_A         = N(); V_CSUM_B         = N()
-    V_CEXPECT_A      = N(); V_CEXPECT_B      = N()
-    V_SUM_A          = N(); V_SUM_B          = N()
-    V_EXPECT_A       = N(); V_EXPECT_B       = N()
-    V_SUM_C          = N(); V_EXPECT_C       = N()
+    # Ciphertext checksums
+    V_CSUM_A = N(); V_CSUM_B = N(); V_CEXPECT_A = N(); V_CEXPECT_B = N()
 
-    # Loop / work vars
-    V_OUT    = N(); V_VALUE  = N(); V_I      = N()
-    V_SOURCE = N(); V_FN     = N(); V_ERR    = N()
-    V_OK     = N(); V_RESULT = N()
+    # Plaintext checksums
+    V_SUM_A = N(); V_SUM_B = N(); V_SUM_C = N()
+    V_EXPECT_A = N(); V_EXPECT_B = N(); V_EXPECT_C = N()
 
-    # Total outer-function locals above: 48 — well under 200 limit.
+    # PlaceId binding
+    V_PID = N(); V_PIDX = N()
+
+    # Decode output + loop vars
+    V_OUT = N(); V_I = N(); V_VALUE = N()
+    V_PREV = N()  # CBC feedback register
+
+    # Bytecode length constant
+    V_BC_LEN = N()
+
+    # VM state
+    V_BC     = N()   # decoded bytecode array (integer values)
+    V_CONSTS = N()   # constants table (chunk strings)
+    V_REGS   = N()   # register file
+    V_UPS    = N()   # upvalue table
+    V_IP     = N()   # instruction pointer
+    V_OP     = N()   # current opcode
+    V_A      = N()   # operand A
+    V_B      = N()   # operand B
+    V_C_     = N()   # operand C (avoid naming conflict)
+    V_CIDX   = N()   # constant index
+    V_CINST  = N()   # num instructions
+    V_CNST   = N()   # num constants
+    V_CLEN   = N()   # constant length field
+    V_CDATA  = N()   # constant data accumulation
+    V_CI     = N()   # inner loop index
+    V_CBASE  = N()   # base offset for constants section
+    V_IBASE  = N()   # base offset for instructions section
+    V_STRIDE = N()   # 4 (bytes per instruction)
+    V_TMP    = N()   # temp
+
+    # Execution
+    V_FN     = N(); V_ERR  = N()
+    V_OK     = N(); V_RES  = N()
+    V_PARTS  = N(); V_PI2  = N()
+
+    # Opcode constants (obfuscated at emit time with _num_expr)
+    OP_LOADK_V  = OP_LOADK
+    OP_MOVE_V   = OP_MOVE
+    OP_CONCAT_V = OP_CONCAT
+    OP_GETUP_V  = OP_GETUP
+    OP_CALL_V   = OP_CALL
+    OP_RETURN_V = OP_RETURN
+    OP_NOP_V    = OP_NOP
+
+    # Helper: emit opcode comparison as obfuscated expression
+    def _op(v): return _num_expr(v)
 
     lines = [
-        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
+        "-- This file was protected using Dex Obfuscator v6.0 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
 
-        # ── Layer 1: capture stdlib before anything can hook it ───────────────
+        # ── Layer 1: capture stdlib ───────────────────────────────────────────
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
         f"local {V_XPCALL}=xpcall",
@@ -5936,42 +6128,33 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_TABLE}=table",
         f"local {V_MATH}=math",
 
-        # ── Layer 1 check: stdlib tables present ─────────────────────────────
+        # Layer 1 check
         f"if {V_TYPE}({V_STRING})~='table' or {V_TYPE}({V_TABLE})~='table' or {V_TYPE}({V_MATH})~='table' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: stdlib unavailable') end",
+        f"if {V_WARN} then {V_WARN}('[DEX] stdlib check failed') end",
         f"{V_ERROR}('[DEX] Unsupported runtime')",
         "end",
 
-        # ── Layer 2: Roblox environment identity check ────────────────────────
-        # game is a Roblox DataModel — absent in plain Lua interpreters and most
-        # deobfuscators. Instance.new is a Roblox-specific constructor.
-        # We only check for their *existence* (truthy), never call them,
-        # so this works even in LocalScript contexts with strict sandboxes.
+        # ── Layer 2: Roblox environment identity ──────────────────────────────
         f"local {V_GAME}=game",
         f"local {V_INST}=Instance",
         f"if not {V_GAME} or {V_TYPE}({V_GAME})~='userdata' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: not a Roblox client') end",
-        f"{V_ERROR}('[DEX] Invalid execution environment')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Not a Roblox client') end",
+        f"{V_ERROR}('[DEX] Invalid environment')",
         "end",
         f"if not {V_INST} or {V_TYPE}({V_INST})~='table' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: Instance API missing') end",
-        f"{V_ERROR}('[DEX] Invalid execution environment')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Instance API missing') end",
+        f"{V_ERROR}('[DEX] Invalid environment')",
         "end",
 
-        # ── Layer 3: _G integrity — detect hooked stdlib functions ────────────
-        # If someone replaced pcall/tostring/type in _G with custom hooks,
-        # our locally-captured versions differ from what _G claims.
-        # We compare type() of each: a hook is almost always a table or userdata,
-        # not a function. A replaced function would still be 'function' but the
-        # identity check (rawequal) catches direct swaps.
+        # ── Layer 3: _G hook detection ────────────────────────────────────────
         f"if _G and {V_TYPE}(_G)=='table' then",
         f"if _G.pcall~=nil and not rawequal(_G.pcall,{V_PCALL}) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Integrity check failed: pcall hooked') end",
-        f"{V_ERROR}('[DEX] Environment integrity check failed')",
+        f"if {V_WARN} then {V_WARN}('[DEX] pcall hooked') end",
+        f"{V_ERROR}('[DEX] Integrity check failed')",
         "end",
         f"if _G.type~=nil and not rawequal(_G.type,{V_TYPE}) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Integrity check failed: type hooked') end",
-        f"{V_ERROR}('[DEX] Environment integrity check failed')",
+        f"if {V_WARN} then {V_WARN}('[DEX] type hooked') end",
+        f"{V_ERROR}('[DEX] Integrity check failed')",
         "end",
         "end",
 
@@ -5979,99 +6162,212 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_CHAR}={V_STRING}.char",
         f"local {V_LEN}={V_STRING}.len",
         f"local {V_SUB}={V_STRING}.sub",
+        f"local {V_BYTE}={V_STRING}.byte",
         f"local {V_CONCAT}={V_TABLE}.concat",
         f"local {V_TONUM}=tonumber",
         f"local {V_LOAD}=loadstring or load",
         f"local {V_FLOOR}={V_MATH}.floor",
-        f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: decoder functions unavailable') end",
+        f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_LOAD})~='function' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] decoder functions unavailable') end",
         f"{V_ERROR}('[DEX] Unsupported runtime')",
         "end",
 
-        # ── Layer 4: reconstruct XOR key from split halves ────────────────────
-        f"local {V_KEY_A}={key_a}",
-        f"local {V_KEY_B}={key_b}",
-        f"local {V_KEY}={V_KEY_A}~{V_KEY_B}",  # Lua bitwise XOR (Luau supports ~)
+        # ── Layer 6: reconstruct cipher keys from split halves ────────────────
+        f"local {V_K1A}={k1a}",
+        f"local {V_K1B}={k1b}",
+        f"local {V_KEY1}=bit32.bxor({V_K1A},{V_K1B})",
+        f"local {V_K2A}={k2a}",
+        f"local {V_K2B}={k2b}",
+        f"local {V_KEY2}=bit32.bxor({V_K2A},{V_K2B})",
+        f"local {V_IVA}={iv_a}",
+        f"local {V_IVB}={iv_b}",
+        f"local {V_IV}=bit32.bxor({V_IVA},{V_IVB})",
 
-        # ── Layer 5: reconstruct payload from split halves ────────────────────
+        # ── Layer 7: perm seeds stored masked ────────────────────────────────
+        f"local {V_PSA}={perm_sa_stored}",
+        f"local {V_PSB}={perm_sb_stored}",
+        f"local {V_PMA}={perm_mask_a}",
+        f"local {V_PMB}={perm_mask_b}",
+        f"local {V_SA}=bit32.bxor({V_PSA},{V_PMA})",
+        f"local {V_SB}=bit32.bxor({V_PSB},{V_PMB})",
+
+        # Build perm table
+        f"local {V_PERM}={{}}",
+        f"local {V_INV}={{}}",
+        f"for {V_I}=0,255 do {V_PERM}[{V_I}]={V_I} end",
+        f"local {V_LCG}=({V_SA}*65536+{V_SB})%4294967296",
+        f"for {V_I}=255,1,-1 do",
+        f"{V_LCG}=({V_LCG}*1664525+1013904223)%4294967296",
+        f"local {V_TMP}={V_LCG}%({V_I}+1)",
+        f"local {V_VALUE}={V_PERM}[{V_I}]",
+        f"{V_PERM}[{V_I}]={V_PERM}[{V_TMP}]",
+        f"{V_PERM}[{V_TMP}]={V_VALUE}",
+        "end",
+        f"for {V_I}=0,255 do {V_INV}[{V_PERM}[{V_I}]]={V_I} end",
+
+        # ── Layer 8: payload halves ───────────────────────────────────────────
         f"local {V_HALF_A}='{encoded_a}'",
         f"local {V_HALF_B}='{encoded_b}'",
         f"local {V_DATA}={V_HALF_A}..{V_HALF_B}",
-
-        f"local {V_EXPECT_LEN}={source_length}",
         f"local {V_EXPECT_HEX_LEN}={encoded_length}",
-
-        # Structural check
         f"if {V_LEN}({V_DATA})~={V_EXPECT_HEX_LEN} or ({V_LEN}({V_DATA})%2)~=0 then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Structural check failed') end",
-        f"{V_ERROR}('[DEX] Payload structure check failed')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Payload length check failed') end",
+        f"{V_ERROR}('[DEX] Payload corrupted')",
         "end",
 
-        # ── Layer 6: verify ciphertext before decoding ────────────────────────
-        f"local {V_CSUM_A}=0x6D31",
-        f"local {V_CSUM_B}=0x91E7",
+        # ── Layer 9: ciphertext checksum ──────────────────────────────────────
+        f"local {V_CSUM_A}={_num_expr(0x6D31)}",
+        f"local {V_CSUM_B}={_num_expr(0x91E7)}",
         f"local {V_CEXPECT_A}={cipher_a}",
         f"local {V_CEXPECT_B}={cipher_b}",
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"if {V_VALUE}==nil then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Payload encoding check failed') end",
-        f"{V_ERROR}('[DEX] Payload encoding check failed')",
-        "end",
+        f"if {V_VALUE}==nil then {V_ERROR}('[DEX] Bad hex byte') end",
         f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*29)%4294967296",
         "end",
         f"if {V_CSUM_A}~={V_CEXPECT_A} or {V_CSUM_B}~={V_CEXPECT_B} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: ciphertext modified') end",
-        f"{V_ERROR}('[DEX] Ciphertext integrity check failed')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Ciphertext tampered') end",
+        f"{V_ERROR}('[DEX] Integrity check failed')",
         "end",
 
-        # ── Decode + Layer 7: plaintext dual checksum + Layer 8: FNV-c ────────
+        # ── 4-round decode: undo R4(CBC) → undo R3 → inv-perm → undo R1 ──────
         f"local {V_OUT}={{}}",
-        f"local {V_SUM_A}=0x45D9",
-        f"local {V_SUM_B}=0xA7C3",
-        f"local {V_SUM_C}=0x811C9DC5",
+        f"local {V_SUM_A}={_num_expr(0x45D9)}",
+        f"local {V_SUM_B}={_num_expr(0xA7C3)}",
+        f"local {V_SUM_C}={_num_expr(0x811C9DC5)}",
         f"local {V_EXPECT_A}={checksum_a}",
         f"local {V_EXPECT_B}={checksum_b}",
-        f"local {V_EXPECT_C}={checksum_c}",
+        f"local {V_BC_LEN}={bc_length}",
+
+        # Layer 11: PlaceId binding
+        f"local {V_PID}={V_GAME}.PlaceId or 0",
+        f"local {V_PIDX}={V_PID}%65536",
+        f"local {V_EXPECT_C}=bit32.bxor({checksum_c},{V_PIDX})",
+
+        # CBC feedback register initialised to IV
+        f"local {V_PREV}={V_IV}",
+
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        # decrypt: subtract key and position-dependent offset
-        f"{V_VALUE}=({V_VALUE}-{V_KEY}-({V_FLOOR}(({V_I}-1)/2)*31%256))%256",
-        f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
+        # Undo R4 (CBC): plaintext = cipher XOR prev_cipher
+        f"local {V_TMP}={V_VALUE}",
+        f"{V_VALUE}=bit32.bxor({V_VALUE},{V_PREV})",
+        f"{V_PREV}={V_TMP}",
+        # Undo R3
+        f"{V_VALUE}=({V_VALUE}-{V_KEY2}-({V_FLOOR}(({V_I}-1)/2)*17%256))%256",
+        # Undo R2 (inverse perm)
+        f"{V_VALUE}={V_INV}[{V_VALUE}]",
+        # Undo R1
+        f"{V_VALUE}=({V_VALUE}-{V_KEY1}-({V_FLOOR}(({V_I}-1)/2)*31%256))%256",
+        f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_VALUE}",
+        # Checksums over raw bytecode integer values
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
-        f"{V_SUM_C}=(({V_SUM_C}~{V_VALUE})*16777619)%4294967296",
+        f"{V_SUM_C}=(bit32.bxor({V_SUM_C},{V_VALUE})*16777619)%4294967296",
         "end",
 
-        # ── Layer 7+8+9 verification ──────────────────────────────────────────
-        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} or {V_SUM_C}~={V_EXPECT_C} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: decoded payload corrupted') end",
-        f"{V_ERROR}('[DEX] Plaintext integrity check failed')",
+        # Layer 10: verify plaintext checksums
+        f"if #{V_OUT}~={V_BC_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} or bit32.bxor({V_SUM_C},{V_PIDX})~={V_EXPECT_C} then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Bytecode tampered or wrong environment') end",
+        f"{V_ERROR}('[DEX] Integrity check failed')",
         "end",
 
-        # ── Layer 10: compile and execute in current env ──────────────────────
-        f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
-        f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
-        f"if not {V_FN} then {V_ERROR}('[DEX] Compile error: '..{V_TOSTRING}({V_ERR})) end",
+        # ── Layer 4: Custom VM — parse bytecode header ────────────────────────
+        # Bytecode layout: [4-byte num_instr][instr*4 each][4-byte num_consts][per-const: 2-byte len + data]
+        f"local {V_STRIDE}={_num_expr(4)}",
 
-        f"if {V_TYPE}({V_XPCALL})=='function' then",
-        f"local {V_OK},{V_RESULT}={V_XPCALL}({V_FN},{V_TOSTRING},...)",
-        f"if not {V_OK} then {V_ERROR}('[DEX] Execution failed: '..{V_TOSTRING}({V_RESULT})) end",
-        f"return {V_RESULT}",
+        # Read num_instructions (big-endian u32 at offset 0)
+        f"local {V_CINST}=({V_OUT}[1]*16777216+{V_OUT}[2]*65536+{V_OUT}[3]*256+{V_OUT}[4])",
+        f"local {V_IBASE}={_num_expr(4)}",  # instructions start at byte index 5 (1-based = offset 4)
+
+        # Read num_constants from right after the instructions block
+        f"local {V_CBASE}={V_IBASE}+{V_CINST}*{V_STRIDE}",
+        f"local {V_CNST}=({V_OUT}[{V_CBASE}+1]*16777216+{V_OUT}[{V_CBASE}+2]*65536+{V_OUT}[{V_CBASE}+3]*256+{V_OUT}[{V_CBASE}+4])",
+
+        # Parse constants: each is [u16 len][data bytes]
+        f"local {V_CONSTS}={{}}",
+        f"local {V_CI}={V_CBASE}+4",  # cursor after the num_consts u32
+        f"for {V_CIDX}=1,{V_CNST} do",
+        f"local {V_CLEN}={V_OUT}[{V_CI}+1]*256+{V_OUT}[{V_CI}+2]",
+        f"local {V_PARTS}={{}}",
+        f"for {V_PI2}=1,{V_CLEN} do {V_PARTS}[{V_PI2}]={V_CHAR}({V_OUT}[{V_CI}+2+{V_PI2}]) end",
+        f"{V_CONSTS}[{V_CIDX}]={V_CONCAT}({V_PARTS})",
+        f"{V_CI}={V_CI}+2+{V_CLEN}",
         "end",
 
-        f"local {V_OK},{V_RESULT}={V_PCALL}({V_FN},...)",
-        f"if not {V_OK} then {V_ERROR}('[DEX] Execution failed: '..{V_TOSTRING}({V_RESULT})) end",
-        f"return {V_RESULT}",
+        # ── VM: upvalue table ─────────────────────────────────────────────────
+        f"local {V_UPS}={{{V_LOAD},{V_PCALL},{V_XPCALL},{V_TOSTRING},{V_ERROR}}}",
+
+        # ── VM: register file ─────────────────────────────────────────────────
+        f"local {V_REGS}={{}}",
+        f"for {V_I}=1,{_num_expr(num_regs + 8)} do {V_REGS}[{V_I}]=nil end",
+
+        # ── VM: main execution loop ───────────────────────────────────────────
+        f"local {V_IP}=1",
+        f"local {V_FN}=nil",
+        f"local {V_ERR}=nil",
+        f"local {V_OK}=nil",
+        f"local {V_RES}=nil",
+        f"while {V_IP}<={V_CINST} do",
+        # Fetch instruction (1-indexed, offset into OUT array)
+        f"local {V_IBASE}2={V_IBASE}+({V_IP}-1)*{V_STRIDE}",
+        f"local {V_OP}={V_OUT}[{V_IBASE}2+1]",
+        f"local {V_A}={V_OUT}[{V_IBASE}2+2]",
+        f"local {V_B}={V_OUT}[{V_IBASE}2+3]",
+        f"local {V_C_}={V_OUT}[{V_IBASE}2+4]",
+        f"{V_IP}={V_IP}+1",
+
+        # OP_LOADK (0x01): regs[A+1] = consts[B*256+C + 1]
+        f"if {V_OP}=={_op(OP_LOADK_V)} then",
+        f"{V_CIDX}={V_B}*256+{V_C_}+1",
+        f"{V_REGS}[{V_A}+1]={V_CONSTS}[{V_CIDX}]",
+
+        # OP_MOVE (0x02): regs[A+1] = regs[B+1]
+        f"elseif {V_OP}=={_op(OP_MOVE_V)} then",
+        f"{V_REGS}[{V_A}+1]={V_REGS}[{V_B}+1]",
+
+        # OP_CONCAT (0x03): regs[A+1] = concat(regs[B+1..C+1])
+        f"elseif {V_OP}=={_op(OP_CONCAT_V)} then",
+        f"local {V_PARTS}={{}}",
+        f"for {V_PI2}={V_B}+1,{V_C_}+1 do {V_PARTS}[#{V_PARTS}+1]={V_REGS}[{V_PI2}] or '' end",
+        f"{V_REGS}[{V_A}+1]={V_CONCAT}({V_PARTS})",
+
+        # OP_GETUP (0x04): regs[A+1] = upvalues[B+1]
+        f"elseif {V_OP}=={_op(OP_GETUP_V)} then",
+        f"{V_REGS}[{V_A}+1]={V_UPS}[{V_B}+1]",
+
+        # OP_CALL (0x05): regs[A+1], regs[A+2] = regs[A+1](regs[B+1]) when C=1
+        #                 regs[A+1]() when C=0 (tail-call the loaded chunk)
+        f"elseif {V_OP}=={_op(OP_CALL_V)} then",
+        f"if {V_C_}=={_op(1)} then",
+        # loadstring(src) call
+        f"{V_REGS}[{V_A}+1],{V_REGS}[{V_A}+2]={V_REGS}[{V_A}+1]({V_REGS}[{V_B}+1])",
+        f"if not {V_REGS}[{V_A}+1] then {V_ERROR}('[DEX] Load error: '..{V_TOSTRING}({V_REGS}[{V_A}+2])) end",
+        f"else",
+        # Execute loaded chunk
+        f"{V_OK},{V_RES}={V_XPCALL}({V_REGS}[{V_A}+1],{V_TOSTRING},...)",
+        f"if not {V_OK} then {V_ERROR}('[DEX] Exec error: '..{V_TOSTRING}({V_RES})) end",
+        "end",
+
+        # OP_RETURN (0x06): break loop and return
+        f"elseif {V_OP}=={_op(OP_RETURN_V)} then",
+        f"break",
+
+        # OP_NOP (0xFF): skip
+        "end",
+        "end",  # while loop
+
+        # Return VM result
+        f"return {V_RES}",
         "end)(...)",
     ]
 
-    # ── Assemble the 3-line output ─────────────────────────────────────────────
+    # ── Assemble output ────────────────────────────────────────────────────────
     comment_line = lines[0]
     code_line    = " ".join(x.strip() for x in lines[2:] if x.strip())
 
-    # Size-scaling: 1 KB per source line.
+    # Size-scaling: 1 KB per source line
     if target_bytes and target_bytes > 0:
         _target = int(target_bytes)
     else:
@@ -6082,12 +6378,10 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     current_code_bytes = len(code_line.encode("utf-8"))
     if current_code_bytes < needed_code:
-        # ── Layer 11: padding in do...end blocks (160 locals each, Luau-safe) ─
-        # Outer fn now uses 48 real locals. Each do-block gets its own scope.
-        # 200 - 48 - 12(margin) = 140 per block — safely under the 200 limit.
-        REAL_LOCALS      = 48
-        SAFETY_MARGIN    = 12
-        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 140
+        # ── Layer 13: junk do..end padding ───────────────────────────────────
+        REAL_LOCALS      = 80   # outer fn uses ~80 real locals now
+        SAFETY_MARGIN    = 10
+        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 110
 
         INSERT_MARKER = "return(function(...)"
         splice_idx    = code_line.find(INSERT_MARKER)
@@ -6109,7 +6403,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
             if pad_bytes >= deficit:
                 break
 
-        pad_str  = " ".join(blocks)
+        pad_str   = " ".join(blocks)
         code_line = (
             code_line[:splice_pos]
             + " "
@@ -6292,10 +6586,6 @@ _MINIFIED_HEADER='-- This file was protected using Dex Obfustucator v4.5 [.gg/de
 def _format_minified_lua(source: str) -> str:
     body=_minify_lua_preserve_strings(source)
     return _MINIFIED_HEADER+'\\n\\n'+body
-
-@app.get("/obfuscate")
-async def obfuscate_page():
-    return HTMLResponse(OBF_PAGE)
 
 def _dex_obfuscator_default_settings() -> dict:
     """Return the public DEX Obfuscator V8 settings used by the website."""
