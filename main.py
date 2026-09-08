@@ -5920,104 +5920,110 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
 
     return payload
 
-def _target_dex_size_from_source_lines(source: str) -> int:
-    """Return the final DEX target size: approximately 1 KiB per input line."""
+def _source_line_target_bytes(source: str, kib_per_line: int = 1024) -> int:
+    """Map source line count to the requested approximate final DEX payload size."""
     line_count = max(1, len(str(source or "").splitlines()))
-    return min(line_count * 1024, DEX_FINAL_MAX_BYTES)
+    return line_count * int(kib_per_line)
 
 
-def _pad_lua_payload_to_size(payload: str, target_bytes: int) -> str:
+def _make_lua_padding_code(target_bytes: int, current_bytes: int, used=None) -> str:
     """
-    Grow the final DEX artifact with syntactically valid Lua/Luau code rather
-    than an obvious wall of `x` characters.
+    Build executable-but-inert Lua padding on the same physical line as the
+    protected body. Padding is byte-sized rather than line-based so the final
+    file stays at approximately `source_lines * 1 KiB`.
 
-    The generated code is deliberately unreachable: each chunk defines a
-    uniquely named local function and never invokes it.  That gives the output
-    real Lua syntax/structure without adding meaningful execution work or
-    depending on version-specific helpers such as getfenv/setfenv.
+    The generated probes do not depend on a particular executor. They only
+    read capability/type information and return immediately, which keeps the
+    protected payload semantics unchanged.
+    """
+    if target_bytes <= current_bytes:
+        return ""
 
-    The target is still approximately 1 KiB per original source line, as
-    controlled by _target_dex_size_from_source_lines().
+    used = used if used is not None else set()
+    chunks = []
+    # Keep each fragment reasonably small so the generator can converge
+    # without producing enormous temporary strings.
+    templates = (
+        "local {n}=type(getfenv)=='function' and getfenv or nil",
+        "local {n}=type(setfenv)=='function' and setfenv or nil",
+        "local {n}=type(loadstring)=='function' and loadstring or nil",
+        "local {n}=type(load)=='function' and load or nil",
+        "local {n}=type(debug)=='table' and debug or nil",
+        "local {n}=type(string)=='table' and string.len or nil",
+        "local {n}=type(table)=='table' and table.concat or nil",
+        "local {n}=type(math)=='table' and math.floor or nil",
+        "local {n}=type(pcall)=='function' and pcall or nil",
+        "local {n}=type(xpcall)=='function' and xpcall or nil",
+    )
+
+    # Each fragment is genuine Lua code and is placed on the existing payload
+    # line; no padding newlines are introduced.
+    while current_bytes + len(" ".join(chunks).encode("utf-8")) < target_bytes:
+        template = _RNG.choice(templates)
+        name = _unique_name(used)
+        fragment = template.format(n=name) + ";"
+        candidate = (" ".join(chunks + [fragment])).encode("utf-8")
+        if len(candidate) >= target_bytes - current_bytes:
+            # Fill the remaining gap with a harmless arithmetic expression.
+            # It is executable Lua, not a comment/string-only byte dump.
+            remaining = target_bytes - current_bytes - len(candidate)
+            if remaining > 8:
+                filler_name = _unique_name(used)
+                filler = f"local {filler_name}=({len(candidate)}-{len(candidate)})"
+                chunks.append(fragment)
+                current_bytes += len((" ".join(chunks)).encode("utf-8"))
+                # Continue with the normal convergence loop below.
+                chunks.append(filler + ";")
+            else:
+                chunks.append(fragment)
+            break
+        chunks.append(fragment)
+
+    return " ".join(chunks)
+
+
+def _pad_lua_payload_to_minimum(payload, target_bytes=None, source=None):
+    """
+    Pad the final Lua payload to an approximate target size while preserving
+    the existing three-line layout.
+
+    When `source` is supplied and `target_bytes` is omitted, the target is
+    `source_line_count * 1024` bytes. Padding is appended to line 3 as
+    executable inert Lua code; it never creates a new line.
     """
     payload = str(payload or "")
-    target_bytes = max(0, int(target_bytes))
+    if target_bytes is None:
+        target_bytes = _source_line_target_bytes(source or payload)
+
     current = len(payload.encode("utf-8"))
     if current >= target_bytes:
         return payload
 
-    parts = [payload.rstrip("\n")]
-    current = len("\n".join(parts).encode("utf-8"))
-    remaining = target_bytes - current
+    parts = payload.split("\n", 2)
+    if len(parts) < 3:
+        # Keep the documented three-line layout even for unusual callers.
+        parts = (parts + ["", ""])[:3]
 
-    # Real, portable Lua/Luau filler.  Nothing is called, so the filler has
-    # effectively zero runtime cost after parsing.
-    body_templates = (
-        "local a=({1,2,3,4,5}) local b=0 for i=1,#a do b=b+a[i] end",
-        "local t={alpha=1,beta=2,gamma=3} local q=t.alpha+t.beta+t.gamma",
-        "local s='dex' local n=#s local r=s:sub(1,n)",
-        "local x=17 local y=29 local z=((x*y)-y+x)-x",
-        "local ok,v=pcall(function() return type(123)=='number' end)",
-        "local m={1,4,9,16} local total=0 for i=1,#m do total=total+m[i] end",
-        "local k='payload' local c=0 for i=1,#k do c=c+string.byte(k,i) end",
-        "local u=0 for i=1,8 do u=(u*33+i)%65536 end",
-        "local a,b=3,7 local c=(a+b)*(b-a) local d=c-(b*b-a*a)",
-        "local t={} t.one=1 t.two=2 t.three=3 local q=t.one+t.two+t.three",
-    )
+    used = set(re.findall(r"\\b[A-Za-z_][A-Za-z0-9_]*\\b", parts[2]))
+    padding = _make_lua_padding_code(target_bytes, current, used)
 
-    def make_chunk(index: int) -> str:
-        name = "_dexpad_" + _rand_name(10) + "_" + str(index)
-        body = body_templates[index % len(body_templates)]
-        # A local function declaration is valid in Lua 5.x/Luau and is never
-        # invoked.  The surrounding do/end keeps every generated symbol local.
-        return f"do local function {name}() {body} return {index % 97} end end"
+    if padding:
+        body = parts[2].rstrip()
+        # The generated wrapper ends with `end)(...)`. Insert padding before
+        # that outer function terminator so Lua's `return` statements remain
+        # legal (Lua requires return to terminate its containing block).
+        marker = "end)(...)"
+        if body.endswith(marker):
+            body = body[:-len(marker)].rstrip() + " " + padding + " " + marker
+        else:
+            # Fallback for custom callers whose wrapper has a different tail.
+            body += " " + padding
+        parts[2] = body
 
-    index = 0
-
-    # Add complete code chunks while they fit.  A small safety margin avoids
-    # producing a truncated Lua statement.
-    while remaining >= 64:
-        chunk = make_chunk(index)
-        candidate = "\n" + chunk
-        size = len(candidate.encode("utf-8"))
-        if size > remaining:
-            break
-        parts.append(chunk)
-        remaining -= size
-        index += 1
-
-    # If only a small tail remains, use a compact valid function declaration
-    # whose identifier is length-adjusted to consume as much of the target as
-    # possible.  We never emit a synthetic X-filled comment.
-    if remaining > 0:
-        prefix = "\ndo local function "
-        suffix = "() end end"
-        fixed = len((prefix + suffix).encode("utf-8"))
-        if remaining >= fixed + 1:
-            name_len = remaining - fixed
-            name_len = max(1, name_len)
-            tail_name = "p" * name_len
-            tail = prefix + tail_name + suffix
-            tail_size = len(tail.encode("utf-8"))
-            if tail_size <= remaining:
-                parts.append(tail.lstrip("\n"))
-                remaining -= tail_size
-
-    # Finish to the exact byte target with harmless Lua whitespace only when
-    # the remaining space is too small for another complete statement.
-    result = "\n".join(parts)
-    result_bytes = len(result.encode("utf-8"))
-    if result_bytes < target_bytes:
-        result += " " * (target_bytes - result_bytes)
-    elif result_bytes > target_bytes:
-        # This should not occur because every chunk is checked before append,
-        # but keep the helper defensive if its sizing logic is changed later.
-        result = result.encode("utf-8")[:target_bytes].decode("utf-8", errors="ignore")
-
-    return result
-
-def _pad_lua_payload_to_minimum(payload):
-    """Legacy compatibility helper."""
-    return str(payload or "")
+    # A final deterministic no-op can close a small residual gap without
+    # introducing a newline. Exact byte equality is not required; the caller
+    # targets the requested KiB scale.
+    return "\n".join(parts)
 
 
 def obfuscate_lua_bundle(source, publish=True, level="hard"):
@@ -6052,7 +6058,7 @@ def obfuscate_lua_bundle(source, publish=True, level="hard"):
 
     # Build the protected Lua payload without publishing it twice.
     level = normalize_obf_level(level)
-    lua_file = _pad_lua_payload_to_size(obfuscate_lua(source, publish=False, level=level, minimum_size=True), _target_dex_size_from_source_lines(source))
+    lua_file = obfuscate_lua(source, publish=False, level=level, minimum_size=True)
 
     if publish:
         # Keep the hosted raw-loader copy compact. The executable content is
@@ -6102,9 +6108,6 @@ def obfuscate_lua_safe(source, publish=True):
 OBF_RATE_LIMIT = 8
 OBF_RATE_WINDOW = 60.0
 OBF_MAX_SOURCE = 16 * 1024 * 1024
-# Final DEX output target: about 1 KiB per input source line.
-# Override with DEX_FINAL_MAX_BYTES to change the deployment ceiling.
-DEX_FINAL_MAX_BYTES = max(1024, int(os.environ.get("DEX_FINAL_MAX_BYTES", str(8 * 1024 * 1024))))
 
 OBF_PAGE = r"""<!doctype html>
 <html lang="en"><head><link rel="icon" type="image/webp" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536"><link rel="shortcut icon" type="image/webp" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536"><link rel="apple-touch-icon" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536">
@@ -6436,13 +6439,16 @@ async def obfuscate_api(request: Request):
             intermediate_source,  # tiny loadstring, not the full goofy payload
             False,                 # publish=False — we publish it ourselves below
             "hard",                # maximum cipher rounds / smallest block sizes
-            False,                 # minimum_size=False — sizing is applied below
+            False,                 # minimum_size=False — padding is applied below
         )
-
-        # Scale the FINAL DEX artifact from the original source line count.
-        # The filler consists only of Lua comments, so executable behavior is unchanged.
-        dex_target_bytes = _target_dex_size_from_source_lines(source)
-        dex_obfuscated = _pad_lua_payload_to_size(dex_obfuscated, dex_target_bytes)
+        # Match the final DEX layer to the submitted source size:
+        # ~500 source lines -> ~500 KiB, ~1000 -> ~1 MiB, etc.
+        dex_target_bytes = _source_line_target_bytes(source)
+        dex_obfuscated = _pad_lua_payload_to_minimum(
+            dex_obfuscated,
+            target_bytes=dex_target_bytes,
+            source=source,
+        )
 
         if not dex_obfuscated or not dex_obfuscated.strip():
             raise RuntimeError("DEX obfuscator returned an empty payload.")
