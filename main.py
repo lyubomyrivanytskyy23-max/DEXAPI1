@@ -5920,8 +5920,44 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
 
     return payload
 
+def _target_dex_size_from_source_lines(source: str) -> int:
+    """Return the final DEX target size: approximately 1 KiB per input line."""
+    line_count = max(1, len(str(source or "").splitlines()))
+    return min(line_count * 1024, DEX_FINAL_MAX_BYTES)
+
+
+def _pad_lua_payload_to_size(payload: str, target_bytes: int) -> str:
+    """Pad only with inert Lua comments so runtime behavior remains unchanged."""
+    payload = str(payload or "")
+    target_bytes = max(0, int(target_bytes))
+    current = len(payload.encode("utf-8"))
+    if current >= target_bytes:
+        return payload
+
+    marker = "-- DEX-PADDING:"
+    chunk = "x" * 900
+    parts = [payload.rstrip("\n")]
+    remaining = target_bytes - current
+
+    while remaining > 0:
+        line = marker + chunk
+        line_bytes = len(("\n" + line).encode("utf-8"))
+        if line_bytes <= remaining:
+            parts.append(line)
+            remaining -= line_bytes
+            continue
+
+        usable = max(0, remaining - len(("\n" + marker).encode("utf-8")))
+        if usable <= 0:
+            break
+        parts.append(marker + ("x" * usable))
+        remaining = 0
+
+    return "\n".join(parts)
+
+
 def _pad_lua_payload_to_minimum(payload):
-    """Legacy compatibility helper; compact builds are never artificially padded."""
+    """Legacy compatibility helper."""
     return str(payload or "")
 
 
@@ -5957,7 +5993,7 @@ def obfuscate_lua_bundle(source, publish=True, level="hard"):
 
     # Build the protected Lua payload without publishing it twice.
     level = normalize_obf_level(level)
-    lua_file = obfuscate_lua(source, publish=False, level=level, minimum_size=True)
+    lua_file = _pad_lua_payload_to_size(obfuscate_lua(source, publish=False, level=level, minimum_size=True), _target_dex_size_from_source_lines(source))
 
     if publish:
         # Keep the hosted raw-loader copy compact. The executable content is
@@ -6007,6 +6043,9 @@ def obfuscate_lua_safe(source, publish=True):
 OBF_RATE_LIMIT = 8
 OBF_RATE_WINDOW = 60.0
 OBF_MAX_SOURCE = 16 * 1024 * 1024
+# Final DEX output target: about 1 KiB per input source line.
+# Override with DEX_FINAL_MAX_BYTES to change the deployment ceiling.
+DEX_FINAL_MAX_BYTES = max(1024, int(os.environ.get("DEX_FINAL_MAX_BYTES", str(8 * 1024 * 1024))))
 
 OBF_PAGE = r"""<!doctype html>
 <html lang="en"><head><link rel="icon" type="image/webp" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536"><link rel="shortcut icon" type="image/webp" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536"><link rel="apple-touch-icon" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536">
@@ -6338,8 +6377,13 @@ async def obfuscate_api(request: Request):
             intermediate_source,  # tiny loadstring, not the full goofy payload
             False,                 # publish=False — we publish it ourselves below
             "hard",                # maximum cipher rounds / smallest block sizes
-            False,                 # minimum_size=False — no extra padding
+            False,                 # minimum_size=False — sizing is applied below
         )
+
+        # Scale the FINAL DEX artifact from the original source line count.
+        # The filler consists only of Lua comments, so executable behavior is unchanged.
+        dex_target_bytes = _target_dex_size_from_source_lines(source)
+        dex_obfuscated = _pad_lua_payload_to_size(dex_obfuscated, dex_target_bytes)
 
         if not dex_obfuscated or not dex_obfuscated.strip():
             raise RuntimeError("DEX obfuscator returned an empty payload.")
