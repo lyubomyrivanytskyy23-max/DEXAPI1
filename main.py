@@ -6047,18 +6047,18 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # ── Layer 5: reconstruct XOR keys from split halves ───────────────────
         f"local {V_K1A}={k1a}",
         f"local {V_K1B}={k1b}",
-        f"local {V_KEY1}={V_K1A}~{V_K1B}",
+        f"local {V_KEY1}=bit32.bxor({V_K1A},{V_K1B})",
         f"local {V_K2A}={k2a}",
         f"local {V_K2B}={k2b}",
-        f"local {V_KEY2}={V_K2A}~{V_K2B}",
+        f"local {V_KEY2}=bit32.bxor({V_K2A},{V_K2B})",
 
         # ── Layer 6: reconstruct perm seeds from masked stored values ─────────
         f"local {V_PSA}={perm_sa_stored}",
         f"local {V_PSB}={perm_sb_stored}",
         f"local {V_PMA}={perm_mask_a}",
         f"local {V_PMB}={perm_mask_b}",
-        f"local {V_SA}={V_PSA}~{V_PMA}",
-        f"local {V_SB}={V_PSB}~{V_PMB}",
+        f"local {V_SA}=bit32.bxor({V_PSA},{V_PMA})",
+        f"local {V_SB}=bit32.bxor({V_PSB},{V_PMB})",
 
         # Build permutation table at runtime via LCG Fisher-Yates
         # perm[i] maps ciphertext byte → shuffled position (forward perm)
@@ -6117,7 +6117,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # is wrong for any other game.
         f"local {V_PID}={V_GAME}.PlaceId or 0",
         f"local {V_PIDX}={V_PID}%65536",
-        f"local {V_EXPECT_C}={checksum_c}~{V_PIDX}",
+        f"local {V_EXPECT_C}=bit32.bxor({checksum_c},{V_PIDX})",
 
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
@@ -6131,12 +6131,12 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
         # FNV-1a over plaintext bytes
-        f"{V_SUM_C}=(({V_SUM_C}~{V_VALUE})*16777619)%4294967296",
+        f"{V_SUM_C}=(bit32.bxor({V_SUM_C},{V_VALUE})*16777619)%4294967296",
         "end",
 
         # ── Layer 9+10 verification ───────────────────────────────────────────
         # XOR sum_c with PlaceId tag so check is PlaceId-bound
-        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} or ({V_SUM_C}~{V_PIDX})~={V_EXPECT_C} then",
+        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} or bit32.bxor({V_SUM_C},{V_PIDX})~={V_EXPECT_C} then",
         f"if {V_WARN} then {V_WARN}('[DEX] Plaintext tampered or wrong environment') end",
         f"{V_ERROR}('[DEX] Integrity check failed')",
         "end",
@@ -6399,10 +6399,6 @@ _MINIFIED_HEADER='-- This file was protected using Dex Obfustucator v4.5 [.gg/de
 def _format_minified_lua(source: str) -> str:
     body=_minify_lua_preserve_strings(source)
     return _MINIFIED_HEADER+'\\n\\n'+body
-
-@app.get("/obfuscate")
-async def obfuscate_page():
-    return HTMLResponse(OBF_PAGE)
 
 def _dex_obfuscator_default_settings() -> dict:
     """Return the public DEX Obfuscator V8 settings used by the website."""
