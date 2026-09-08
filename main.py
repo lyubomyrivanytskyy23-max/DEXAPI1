@@ -5725,17 +5725,16 @@ def _build_loadstring(raw_url):
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -> str:
     """
-    Compatibility-first DEX wrapper.
+    Compact Lua protection wrapper.
 
-    The generated Lua is self-decoding and keeps the original payload in an
-    encoded byte stream until runtime.  The amount of inert arithmetic noise
-    scales with the source size (with a hard cap), so larger inputs naturally
-    produce more wrapper material without changing the decoded program.
+    The previous implementation used ten full permutation/XOR/rotation rounds,
+    binary-token expansion, fragment shuffling, and artificial 128 KiB padding.
+    This version keeps the wrapper small while retaining basic integrity and
+    runtime sanity checks.
 
-    The wrapper intentionally avoids executor/debug-environment probing.  Its
-    integrity check only verifies that the protected byte stream was not
-    corrupted, which prevents false "tamper detected" messages on ordinary
-    Lua/Luau runtimes.
+    This is compatibility-oriented protection, not a guarantee against a
+    determined debugger/dumper. Client-side Lua can always be inspected by the
+    environment executing it.
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -5745,136 +5744,74 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     if not source:
         raise ValueError("Lua source is empty.")
 
-    level = normalize_obf_level(level)
+    normalize_obf_level(level)
 
-    # Three independent additive/rotational passes.  Everything is performed
-    # with byte arithmetic so the generated decoder stays compatible with
-    # Lua 5.1-style runtimes and Luau; no bitwise operators are emitted.
     src = source.encode("utf-8")
-    keys = [
-        _RNG.randint(1, 255),
-        _RNG.randint(1, 255),
-        _RNG.randint(1, 255),
-    ]
+    key = _RNG.randint(1, 255)
 
-    encrypted = bytearray(src)
-    for round_index, key in enumerate(keys):
-        encrypted = bytearray(
-            (
-                value
-                + key
-                + ((index + 1) * (17 + round_index * 13))
-                + (index * index * (3 + round_index))
-            ) & 0xFF
-            for index, value in enumerate(encrypted)
-        )
-        encrypted.reverse()
+    # One compact reversible byte stream. No ten-round cipher, token expansion,
+    # fragment shuffle, or padding.
+    encrypted = bytes(
+        (value + key + ((index * 31) & 0xFF)) & 0xFF
+        for index, value in enumerate(src)
+    )
 
-    # Two independent digests make accidental corruption extremely unlikely.
-    checksum_a = 0x45D9
-    checksum_b = 0x9E37
+    checksum = 0x45D9
     for index, value in enumerate(src, 1):
-        checksum_a = (checksum_a * 33 + value + index) & 0xFFFFFFFF
-        checksum_b = (checksum_b * 65599 + value * 7 + index * 13) & 0xFFFFFFFF
+        checksum = (checksum * 33 + value + index) & 0xFFFFFFFF
 
     used = set()
     N = lambda: _unique_name(used)
 
-    V_TYPE = N(); V_LOAD = N(); V_CHAR = N(); V_LEN = N(); V_SUB = N()
-    V_TONUM = N(); V_CONCAT = N(); V_DATA = N(); V_BUF = N(); V_VALUE = N()
-    V_I = N(); V_ROUND = N(); V_KEY = N(); V_POS = N(); V_SUM_A = N()
-    V_SUM_B = N(); V_EXPECT_A = N(); V_EXPECT_B = N(); V_SOURCE = N()
-    V_FN = N(); V_ERR = N(); V_TMP = N()
+    V_CHAR, V_LEN, V_SUB, V_CONCAT = N(), N(), N(), N()
+    V_TONUM, V_LOAD, V_ERR, V_I, V_SUM = N(), N(), N(), N(), N()
+    V_DATA, V_OUT, V_VALUE, V_EXPECT = N(), N(), N(), N()
+    V_TYPE, V_PCALL, V_DEBUG, V_OK = N(), N(), N(), N()
+    V_SOURCE, V_FN = N(), N()
 
     encoded = encrypted.hex()
 
-    # More source -> more deterministic-looking inert declarations.  The cap
-    # prevents a very large submission from creating an unreasonable wrapper.
-    source_size = len(src)
-    noise_count = min(320, max(8, source_size // 96 + 8))
-    noise = []
-    for _ in range(noise_count):
-        name = N()
-        a = _RNG.randint(1000, 900000)
-        b = _RNG.randint(1, 999)
-        c = _RNG.randint(1, 999)
-        noise.append(f"local {name}=(({a}+{b})-{b}+{c}-{c})")
-    noise_block = " ".join(noise)
-
     lines = [
-        "-- This file was protected using Dex Obfuscator v6.0 [.gg/dexfinder]",
+        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
-        noise_block,
         f"local {V_TYPE}=type",
+        f"local {V_PCALL}=pcall",
         f"local {V_LOAD}=loadstring or load",
-        f"if {V_TYPE}({V_LOAD})~='function' then error('Unsupported Lua runtime: loadstring/load unavailable') end",
+        f"if {V_TYPE}(string)~='table' or {V_TYPE}(table)~='table' or {V_TYPE}({V_LOAD})~='function' then",
+        "if warn then warn('[DEX] Environment check failed: required Lua runtime functions are unavailable.') end",
+        "error('Unsupported Lua runtime')",
+        "end",
         f"local {V_CHAR}=string.char",
         f"local {V_LEN}=string.len",
         f"local {V_SUB}=string.sub",
         f"local {V_TONUM}=tonumber",
         f"local {V_CONCAT}=table.concat",
         f"local {V_DATA}='{encoded}'",
-        f"local {V_BUF}={{}}",
-        f"local {V_SUM_A}=0x45D9",
-        f"local {V_SUM_B}=0x9E37",
-        f"local {V_EXPECT_A}={checksum_a}",
-        f"local {V_EXPECT_B}={checksum_b}",
-        f"local {V_KEY}={{{keys[0]},{keys[1]},{keys[2]}}}",
+        f"local {V_OUT}={{}}",
+        f"local {V_SUM}=0x45D9",
+        f"local {V_EXPECT}={checksum}",
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
-        f"{V_BUF}[(({V_I}+1)/2)]={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
+        f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
+        f"{V_VALUE}=({V_VALUE}-{key}-(((({V_I}-1)/2)*31)%256))%256",
+        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
+        f"{V_SUM}=({V_SUM}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
         "end",
-        f"for {V_ROUND}=1,3 do",
-        f"local {V_TMP}={{}}",
-        f"local {V_KEY[0] if False else V_KEY}[{V_ROUND}]={V_KEY}[{V_ROUND}]",
-        f"for {V_I}=1,#{V_BUF} do",
-        f"local {V_POS}=#{V_BUF}-{V_I}+1",
-        f"local {V_VALUE}={V_BUF}[{V_POS}]",
-        f"local {V_KEY if False else V_TMP}={V_VALUE}",
-        f"{V_TMP}=({V_TMP}-{V_KEY}[{V_ROUND}]-({V_POS}*(17+({V_ROUND}-1)*13))-(({V_POS}-1)*({V_POS}-1)*(3+{V_ROUND}-1)))%256",
-        f"{V_TMP}[{V_I}]={V_TMP}",
+        f"if {V_SUM}~={V_EXPECT} then",
+        "if warn then warn('[DEX] Anti-tamper check failed: protected payload was modified.') end",
+        "error('Protected payload integrity check failed')",
         "end",
-        f"{V_BUF}={V_TMP}",
+        f"local {V_DEBUG}=debug",
+        f"if {V_TYPE}({V_DEBUG})=='table' and {V_TYPE}({V_DEBUG}.getinfo)=='function' then",
+        f"local {V_OK}={V_PCALL}({V_DEBUG}.getinfo,1,'f')",
+        f"if not {V_OK} and warn then warn('[DEX] Environment warning: debug API behaved unexpectedly.') end",
         "end",
-        f"for {V_I}=1,#{V_BUF} do",
-        f"local {V_VALUE}={V_BUF}[{V_I}]",
-        f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_I})%4294967296",
-        f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}*7+{V_I}*13)%4294967296",
-        "end",
-        f"if {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} then",
-        "error('Protected payload corrupted: integrity check failed')",
-        "end",
-        f"local {V_SOURCE}={{}}",
-        f"for {V_I}=1,#{V_BUF} do {V_SOURCE}[{V_I}]={V_CHAR}({V_BUF}[{V_I}]) end",
-        f"local {V_SOURCE}={V_CONCAT}({V_SOURCE})",
+        f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
         f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
         f"if not {V_FN} then error('Internal Error: '..tostring({V_ERR})) end",
         f"return {V_FN}(...)",
         "end)(...)",
     ]
-
-    # Fix the decoder's temporary variable naming to keep the generated Lua
-    # simple and unambiguous.  This is done here rather than by a Lua formatter.
-    # Rebuild the round loop with a dedicated temp scalar/table pair.
-    T_SCALAR = N()
-    T_TABLE = N()
-    round_lines = [
-        f"for {V_ROUND}=3,1,-1 do",
-        f"local {T_TABLE}={{}}",
-        f"for {V_I}=1,#{V_BUF} do",
-        f"local {V_POS}=#{V_BUF}-{V_I}+1",
-        f"local {V_VALUE}={V_BUF}[{V_POS}]",
-        f"local {T_SCALAR}=({V_VALUE}-{V_KEY}[{V_ROUND}]-({V_I}*(17+({V_ROUND}-1)*13))-(({V_I}-1)*({V_I}-1)*(3+{V_ROUND}-1)))%256",
-        f"{T_TABLE}[{V_I}]={T_SCALAR}",
-        "end",
-        f"{V_BUF}={T_TABLE}",
-        "end",
-    ]
-    bad_round = lines.index(f"for {V_ROUND}=1,3 do")
-    end_round = bad_round
-    while end_round < len(lines) and lines[end_round] != "end":
-        end_round += 1
-    lines[bad_round:end_round + 1] = round_lines
 
     payload = lines[0] + "\n\n" + " ".join(x.strip() for x in lines[2:] if x.strip())
 
@@ -6297,31 +6234,20 @@ async def obfuscate_api(request: Request):
         # Feed only the short loadstring into the DEX wrapper cipher.  The
         # output is a compact self-decoding Lua blob that, when run, fetches
         # and executes the Goofyscator-protected original script.
-        # ── Step 5: DEX-obfuscate the loadstring in multiple compatibility layers ──
-        # Each layer decodes to the complete previous Lua layer.  The final
-        # runtime chain is therefore: DEX-3 -> DEX-2 -> DEX-1 -> loadstring ->
-        # Goofyscator payload.  The layers are deliberately syntax-portable and
-        # contain no executor/debug-environment detection.
-        dex_layer_source = intermediate_source
-        dex_obfuscated = ""
-        dex_layer_count = 3
-        for _dex_layer_index in range(dex_layer_count):
-            dex_obfuscated = await asyncio.to_thread(
-                obfuscate_lua,
-                dex_layer_source,
-                False,
-                "hard",
-                False,
-            )
-            if not dex_obfuscated or not dex_obfuscated.strip():
-                raise RuntimeError(
-                    f"DEX obfuscator returned an empty payload at layer {_dex_layer_index + 1}."
-                )
-            dex_layer_source = dex_obfuscated
+        dex_obfuscated = await asyncio.to_thread(
+            obfuscate_lua,
+            intermediate_source,  # tiny loadstring, not the full goofy payload
+            False,                 # publish=False — we publish it ourselves below
+            "hard",                # maximum cipher rounds / smallest block sizes
+            False,                 # minimum_size=False — no extra padding
+        )
+
+        if not dex_obfuscated or not dex_obfuscated.strip():
+            raise RuntimeError("DEX obfuscator returned an empty payload.")
 
         # ── Step 6: Publish DEX-obfuscated wrapper to the raw store ─────────
-        # This is the URL that end-users actually copy.  It points to the outer
-        # DEX layer; the Goofyscator payload remains in the private raw-loader chain.
+        # This is the URL that end-users actually copy.  It points to a tiny
+        # DEX blob (~2–4 KB) instead of the full goofyscated script.
         try:
             raw_url, loader_id = _publish_local_payload(dex_obfuscated)
         except Exception as pub_exc:
