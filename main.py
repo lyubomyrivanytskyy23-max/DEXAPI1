@@ -5981,7 +5981,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_SUB}={V_STRING}.sub",
         f"local {V_CONCAT}={V_TABLE}.concat",
         f"local {V_TONUM}=tonumber",
-        f"local {V_LOAD}=loadstring or load",
+        f"local {V_LOAD}=loadstring",
         f"local {V_FLOOR}={V_MATH}.floor",
         f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
         f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: decoder functions unavailable') end",
@@ -5991,7 +5991,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # ── Layer 4: reconstruct XOR key from split halves ────────────────────
         f"local {V_KEY_A}={key_a}",
         f"local {V_KEY_B}={key_b}",
-        f"local {V_KEY}={V_KEY_A}~{V_KEY_B}",  # Lua bitwise XOR (Luau supports ~)
+        f"local {V_KEY}=bit32.bxor({V_KEY_A},{V_KEY_B})",  # Luau bitwise XOR via bit32 library
 
         # ── Layer 5: reconstruct payload from split halves ────────────────────
         f"local {V_HALF_A}='{encoded_a}'",
@@ -6041,7 +6041,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
-        f"{V_SUM_C}=(({V_SUM_C}~{V_VALUE})*16777619)%4294967296",
+        f"{V_SUM_C}=(bit32.bxor({V_SUM_C},{V_VALUE})*16777619)%4294967296",
         "end",
 
         # ── Layer 7+8+9 verification ──────────────────────────────────────────
