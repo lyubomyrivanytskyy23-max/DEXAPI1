@@ -6142,7 +6142,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     # Decoder helpers
     V_CHAR   = N(); V_LEN    = N(); V_SUB    = N()
     V_CONCAT = N(); V_TONUM  = N(); V_LOAD   = N()
-    V_FLOOR  = N()
+    V_FLOOR  = N(); V_BIT32  = N()
 
     # Layer 4 — split key
     V_KEY_A  = N(); V_KEY_B  = N(); V_KEY    = N()
@@ -6163,7 +6163,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     V_SOURCE = N(); V_FN     = N(); V_ERR    = N()
     V_OK     = N(); V_RESULT = N()
 
-    # Total outer-function locals above: 48 — well under 200 limit.
+    # Total outer-function locals above: 49 — well under 200 limit.
 
     lines = [
         "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
@@ -6228,6 +6228,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_TONUM}=tonumber",
         f"local {V_LOAD}=loadstring or load",
         f"local {V_FLOOR}={V_MATH}.floor",
+        f"local {V_BIT32}=bit32",
         f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
         f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: decoder functions unavailable') end",
         f"{V_ERROR}('[DEX] Unsupported runtime')",
@@ -6236,7 +6237,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # ── Layer 4: reconstruct XOR key from split halves ────────────────────
         f"local {V_KEY_A}={key_a}",
         f"local {V_KEY_B}={key_b}",
-        f"local {V_KEY}={V_KEY_A}~{V_KEY_B}",  # Lua bitwise XOR (Luau supports ~)
+        f"local {V_KEY}={V_BIT32}.bxor({V_KEY_A},{V_KEY_B})",  # Luau-compatible XOR via bit32.bxor
 
         # ── Layer 5: reconstruct payload from split halves ────────────────────
         f"local {V_HALF_A}='{encoded_a}'",
@@ -6286,7 +6287,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
-        f"{V_SUM_C}=(({V_SUM_C}~{V_VALUE})*16777619)%4294967296",
+        f"{V_SUM_C}=({V_BIT32}.bxor({V_SUM_C},{V_VALUE})*16777619)%4294967296",
         "end",
 
         # ── Layer 7+8+9 verification ──────────────────────────────────────────
@@ -6328,11 +6329,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     current_code_bytes = len(code_line.encode("utf-8"))
     if current_code_bytes < needed_code:
         # ── Layer 11: padding in do...end blocks (160 locals each, Luau-safe) ─
-        # Outer fn now uses 48 real locals. Each do-block gets its own scope.
-        # 200 - 48 - 12(margin) = 140 per block — safely under the 200 limit.
-        REAL_LOCALS      = 48
+        # Outer fn now uses 49 real locals. Each do-block gets its own scope.
+        # 200 - 49 - 12(margin) = 139 per block — safely under the 200 limit.
+        REAL_LOCALS      = 49
         SAFETY_MARGIN    = 12
-        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 140
+        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 139
 
         INSERT_MARKER = "return(function(...)"
         splice_idx    = code_line.find(INSERT_MARKER)
