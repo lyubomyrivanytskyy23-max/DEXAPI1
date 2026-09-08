@@ -5934,7 +5934,7 @@ def _pad_lua_payload_to_size(payload: str, target_bytes: int) -> str:
     if current >= target_bytes:
         return payload
 
-    marker = "-- DEX-PADDING:"
+    marker = "-- END"
     chunk = "x" * 900
     parts = [payload.rstrip("\n")]
     remaining = target_bytes - current
