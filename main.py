@@ -5866,10 +5866,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         checksum_a = (checksum_a * 33  + value + index)       & 0xFFFFFFFF
         checksum_b = (checksum_b * 65599 + value + (index*17)) & 0xFFFFFFFF
 
-    # ── Layer 8: Third independent FNV-1a-style checksum ─────────────────────
+    # ── Layer 8: Third independent arithmetic checksum ───────────────────────
+    # Deliberately avoids bitwise operators so the generated Luau is parser-safe.
     checksum_c = 0x811C9DC5
-    for value in src:
-        checksum_c = ((checksum_c ^ value) * 0x01000193) & 0xFFFFFFFF
+    for index, value in enumerate(src, 1):
+        checksum_c = (checksum_c * 65599 + value * 97 + index * 131) & 0xFFFFFFFF
 
     source_length  = len(src)
     encoded        = encrypted.hex()
@@ -5887,7 +5888,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     N = lambda: _unique_name(used)
 
     # Layer 1 — stdlib refs (captured before any check so checks can use them)
-    V_TYPE     = N(); V_PCALL  = N(); V_XPCALL   = N()
+    V_TYPE     = N(); V_PCALL  = N(); V_XPCALL   = N(); V_XOR = N()
     V_TOSTRING = N(); V_ERROR  = N(); V_WARN      = N()
     V_STRING   = N(); V_TABLE  = N(); V_MATH      = N()
 
@@ -5937,7 +5938,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_MATH}=math",
 
         # ── Layer 1 check: stdlib tables present ─────────────────────────────
-        f"if {V_TYPE}({V_STRING})~='table' or {V_TYPE}({V_TABLE})~='table' or {V_TYPE}({V_MATH})~='table' then",
+        f"if not ({V_TYPE}({V_STRING})=='table') or not ({V_TYPE}({V_TABLE})=='table') or not ({V_TYPE}({V_MATH})=='table') then",
         f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: stdlib unavailable') end",
         f"{V_ERROR}('[DEX] Unsupported runtime')",
         "end",
@@ -5949,11 +5950,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # so this works even in LocalScript contexts with strict sandboxes.
         f"local {V_GAME}=game",
         f"local {V_INST}=Instance",
-        f"if not {V_GAME} or {V_TYPE}({V_GAME})~='userdata' then",
+        f"if not {V_GAME} or not ({V_TYPE}({V_GAME})=='userdata') then",
         f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: not a Roblox client') end",
         f"{V_ERROR}('[DEX] Invalid execution environment')",
         "end",
-        f"if not {V_INST} or {V_TYPE}({V_INST})~='table' then",
+        f"if not {V_INST} or not ({V_TYPE}({V_INST})=='table') then",
         f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: Instance API missing') end",
         f"{V_ERROR}('[DEX] Invalid execution environment')",
         "end",
@@ -5965,11 +5966,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # not a function. A replaced function would still be 'function' but the
         # identity check (rawequal) catches direct swaps.
         f"if _G and {V_TYPE}(_G)=='table' then",
-        f"if _G.pcall~=nil and not rawequal(_G.pcall,{V_PCALL}) then",
+        f"if not (_G.pcall==nil) and not rawequal(_G.pcall,{V_PCALL}) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Integrity check failed: pcall hooked') end",
         f"{V_ERROR}('[DEX] Environment integrity check failed')",
         "end",
-        f"if _G.type~=nil and not rawequal(_G.type,{V_TYPE}) then",
+        f"if not (_G.type==nil) and not rawequal(_G.type,{V_TYPE}) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Integrity check failed: type hooked') end",
         f"{V_ERROR}('[DEX] Environment integrity check failed')",
         "end",
@@ -5983,7 +5984,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_TONUM}=tonumber",
         f"local {V_LOAD}=loadstring or load",
         f"local {V_FLOOR}={V_MATH}.floor",
-        f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
+        f"if not ({V_TYPE}({V_CHAR})=='function') or not ({V_TYPE}({V_LEN})=='function') or not ({V_TYPE}({V_SUB})=='function') or not ({V_TYPE}({V_CONCAT})=='function') or not ({V_TYPE}({V_TONUM})=='function') or not ({V_TYPE}({V_LOAD})=='function') then",
         f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: decoder functions unavailable') end",
         f"{V_ERROR}('[DEX] Unsupported runtime')",
         "end",
@@ -5991,7 +5992,9 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # ── Layer 4: reconstruct XOR key from split halves ────────────────────
         f"local {V_KEY_A}={key_a}",
         f"local {V_KEY_B}={key_b}",
-        f"local {V_KEY}={V_KEY_A}~{V_KEY_B}",  # Lua bitwise XOR (Luau supports ~)
+        # Arithmetic XOR keeps the generated source free of the `~` operator.
+        f"local {V_XOR}=function(a,b) local r=0 local p=1 while a>0 or b>0 do local aa=a%2 local bb=b%2 if (aa==1 and bb==0) or (aa==0 and bb==1) then r=r+p end a={V_FLOOR}(a/2) b={V_FLOOR}(b/2) p=p*2 end return r end",
+        f"local {V_KEY}={V_XOR}({V_KEY_A},{V_KEY_B})",
 
         # ── Layer 5: reconstruct payload from split halves ────────────────────
         f"local {V_HALF_A}='{encoded_a}'",
@@ -6002,7 +6005,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_EXPECT_HEX_LEN}={encoded_length}",
 
         # Structural check
-        f"if {V_LEN}({V_DATA})~={V_EXPECT_HEX_LEN} or ({V_LEN}({V_DATA})%2)~=0 then",
+        f"if not ({V_LEN}({V_DATA})=={V_EXPECT_HEX_LEN}) or not (({V_LEN}({V_DATA})%2)==0) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Structural check failed') end",
         f"{V_ERROR}('[DEX] Payload structure check failed')",
         "end",
@@ -6021,7 +6024,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*29)%4294967296",
         "end",
-        f"if {V_CSUM_A}~={V_CEXPECT_A} or {V_CSUM_B}~={V_CEXPECT_B} then",
+        f"if not ({V_CSUM_A}=={V_CEXPECT_A}) or not ({V_CSUM_B}=={V_CEXPECT_B}) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: ciphertext modified') end",
         f"{V_ERROR}('[DEX] Ciphertext integrity check failed')",
         "end",
@@ -6041,11 +6044,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
-        f"{V_SUM_C}=(({V_SUM_C}~{V_VALUE})*16777619)%4294967296",
+        f"{V_SUM_C}=({V_SUM_C}*65599+{V_VALUE}*97+{V_I}*131)%4294967296",
         "end",
 
         # ── Layer 7+8+9 verification ──────────────────────────────────────────
-        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} or {V_SUM_C}~={V_EXPECT_C} then",
+        f"if not ({V_LEN}({V_CONCAT}({V_OUT}))=={V_EXPECT_LEN}) or not ({V_SUM_A}=={V_EXPECT_A}) or not ({V_SUM_B}=={V_EXPECT_B}) or not ({V_SUM_C}=={V_EXPECT_C}) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: decoded payload corrupted') end",
         f"{V_ERROR}('[DEX] Plaintext integrity check failed')",
         "end",
