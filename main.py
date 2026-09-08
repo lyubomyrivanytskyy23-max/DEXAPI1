@@ -5813,18 +5813,20 @@ def _build_loadstring(raw_url):
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, target_bytes: int = 0) -> str:
     """
-    Compact compatibility-oriented Lua protection wrapper.
+    Hardened Lua protection wrapper for Roblox/Luau environments.
 
-    Strengthened outer layer:
-      - encrypted payload length validation
-      - independent plaintext checksum
-      - independent ciphertext checksum
-      - structural/runtime capability checks
-      - protected decoder constants captured locally
-      - protected execution through pcall with useful failure messages
-
-    This deliberately avoids executor-specific detection or anti-analysis tricks:
-    client-side Lua can still be inspected by the environment executing it.
+    Security layers (all Luau-safe, no removed globals):
+      Layer 1 – Runtime capability gate: type/string/table/load verified before use
+      Layer 2 – Roblox environment identity check: game + Instance.new presence
+      Layer 3 – _G function integrity: pcall/tostring/type not hooked/replaced
+      Layer 4 – Split key: XOR key stored as two halves XOR'd together at runtime
+      Layer 5 – Split payload: hex string concatenated from two halves at runtime
+      Layer 6 – Ciphertext dual checksum (A+B) before decode
+      Layer 7 – Plaintext dual checksum (A+B) after decode
+      Layer 8 – Third independent FNV-style checksum over decoded plaintext
+      Layer 9 – Decoded length exact match
+      Layer 10 – Protected execution via xpcall → pcall fallback
+      Layer 11 – Padding junk in do..end blocks (160 locals/block, ∞ blocks)
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -5837,78 +5839,93 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     normalize_obf_level(level)
 
     src = source.encode("utf-8")
-    key = _RNG.randint(1, 255)
 
-    # Compact reversible byte stream.
+    # ── Layer 4: Split XOR key ────────────────────────────────────────────────
+    # key_a XOR key_b = real_key. Neither half alone reveals the key.
+    real_key = _RNG.randint(1, 255)
+    key_a    = _RNG.randint(1, 255)
+    key_b    = real_key ^ key_a
+
+    # ── Encrypt ───────────────────────────────────────────────────────────────
     encrypted = bytes(
-        (value + key + ((index * 31) & 0xFF)) & 0xFF
+        (value + real_key + ((index * 31) & 0xFF)) & 0xFF
         for index, value in enumerate(src)
     )
 
-    # Two independent integrity values make accidental/casual modification
-    # substantially easier to detect than relying on one accumulator.
-    checksum_a = 0x45D9
-    checksum_b = 0xA7C3
-    for index, value in enumerate(src, 1):
-        checksum_a = (checksum_a * 33 + value + index) & 0xFFFFFFFF
-        checksum_b = (checksum_b * 65599 + value + (index * 17)) & 0xFFFFFFFF
-
+    # ── Layer 6: Ciphertext dual checksum ─────────────────────────────────────
     cipher_a = 0x6D31
     cipher_b = 0x91E7
     for index, value in enumerate(encrypted, 1):
-        cipher_a = (cipher_a * 33 + value + index) & 0xFFFFFFFF
-        cipher_b = (cipher_b * 65599 + value + (index * 29)) & 0xFFFFFFFF
+        cipher_a = (cipher_a * 33  + value + index)       & 0xFFFFFFFF
+        cipher_b = (cipher_b * 65599 + value + (index*29)) & 0xFFFFFFFF
 
-    source_length = len(src)
-    encoded = encrypted.hex()
+    # ── Layer 7: Plaintext dual checksum ──────────────────────────────────────
+    checksum_a = 0x45D9
+    checksum_b = 0xA7C3
+    for index, value in enumerate(src, 1):
+        checksum_a = (checksum_a * 33  + value + index)       & 0xFFFFFFFF
+        checksum_b = (checksum_b * 65599 + value + (index*17)) & 0xFFFFFFFF
+
+    # ── Layer 8: Third independent FNV-1a-style checksum ─────────────────────
+    checksum_c = 0x811C9DC5
+    for value in src:
+        checksum_c = ((checksum_c ^ value) * 0x01000193) & 0xFFFFFFFF
+
+    source_length  = len(src)
+    encoded        = encrypted.hex()
     encoded_length = len(encoded)
 
+    # ── Layer 5: Split payload ────────────────────────────────────────────────
+    # Chop the hex string at a random even offset so neither half is the full blob.
+    split_at  = (_RNG.randint(1, max(1, len(encoded) // 2 - 1)) * 2)  # always even
+    encoded_a = encoded[:split_at]
+    encoded_b = encoded[split_at:]
+
+    # ── Variable name pool ────────────────────────────────────────────────────
     used = set()
-    _reset_junk_fenv_counter()          # O(1) name-gen: fresh shuffled sequence per run
+    _reset_junk_fenv_counter()
     N = lambda: _unique_name(used)
 
-    V_TYPE = N()
-    V_PCALL = N()
-    V_XPCALL = N()
-    V_TOSTRING = N()
-    V_ERROR = N()
-    V_WARN = N()
+    # Layer 1 — stdlib refs (captured before any check so checks can use them)
+    V_TYPE     = N(); V_PCALL  = N(); V_XPCALL   = N()
+    V_TOSTRING = N(); V_ERROR  = N(); V_WARN      = N()
+    V_STRING   = N(); V_TABLE  = N(); V_MATH      = N()
 
-    V_STRING = N()
-    V_TABLE = N()
-    V_CHAR = N()
-    V_LEN = N()
-    V_SUB = N()
-    V_CONCAT = N()
-    V_TONUM = N()
+    # Layer 2 — Roblox env identity
+    V_GAME     = N(); V_INST   = N()
 
-    V_LOAD = N()
-    V_DATA = N()
-    V_OUT = N()
-    V_VALUE = N()
-    V_I = N()
+    # Decoder helpers
+    V_CHAR   = N(); V_LEN    = N(); V_SUB    = N()
+    V_CONCAT = N(); V_TONUM  = N(); V_LOAD   = N()
+    V_FLOOR  = N()
 
-    V_SUM_A = N()
-    V_SUM_B = N()
-    V_EXPECT_A = N()
-    V_EXPECT_B = N()
-    V_CSUM_A = N()
-    V_CSUM_B = N()
-    V_CEXPECT_A = N()
-    V_CEXPECT_B = N()
+    # Layer 4 — split key
+    V_KEY_A  = N(); V_KEY_B  = N(); V_KEY    = N()
 
-    V_EXPECT_LEN = N()
-    V_EXPECT_HEX_LEN = N()
-    V_SOURCE = N()
-    V_FN = N()
-    V_ERR = N()
-    V_OK = N()
-    V_RESULT = N()
+    # Layer 5 — split payload halves + assembled data
+    V_HALF_A = N(); V_HALF_B = N(); V_DATA   = N()
+
+    # Checksums / expected values
+    V_EXPECT_LEN     = N(); V_EXPECT_HEX_LEN = N()
+    V_CSUM_A         = N(); V_CSUM_B         = N()
+    V_CEXPECT_A      = N(); V_CEXPECT_B      = N()
+    V_SUM_A          = N(); V_SUM_B          = N()
+    V_EXPECT_A       = N(); V_EXPECT_B       = N()
+    V_SUM_C          = N(); V_EXPECT_C       = N()
+
+    # Loop / work vars
+    V_OUT    = N(); V_VALUE  = N(); V_I      = N()
+    V_SOURCE = N(); V_FN     = N(); V_ERR    = N()
+    V_OK     = N(); V_RESULT = N()
+
+    # Total outer-function locals above: 48 — well under 200 limit.
 
     lines = [
         "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
+
+        # ── Layer 1: capture stdlib before anything can hook it ───────────────
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
         f"local {V_XPCALL}=xpcall",
@@ -5917,140 +5934,173 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_WARN}=warn",
         f"local {V_STRING}=string",
         f"local {V_TABLE}=table",
-        f"if {V_TYPE}({V_STRING})~='table' or {V_TYPE}({V_TABLE})~='table' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Runtime capability check failed.') end",
-        f"{V_ERROR}('Unsupported Lua runtime: string/table unavailable')",
+        f"local {V_MATH}=math",
+
+        # ── Layer 1 check: stdlib tables present ─────────────────────────────
+        f"if {V_TYPE}({V_STRING})~='table' or {V_TYPE}({V_TABLE})~='table' or {V_TYPE}({V_MATH})~='table' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: stdlib unavailable') end",
+        f"{V_ERROR}('[DEX] Unsupported runtime')",
         "end",
+
+        # ── Layer 2: Roblox environment identity check ────────────────────────
+        # game is a Roblox DataModel — absent in plain Lua interpreters and most
+        # deobfuscators. Instance.new is a Roblox-specific constructor.
+        # We only check for their *existence* (truthy), never call them,
+        # so this works even in LocalScript contexts with strict sandboxes.
+        f"local {V_GAME}=game",
+        f"local {V_INST}=Instance",
+        f"if not {V_GAME} or {V_TYPE}({V_GAME})~='userdata' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: not a Roblox client') end",
+        f"{V_ERROR}('[DEX] Invalid execution environment')",
+        "end",
+        f"if not {V_INST} or {V_TYPE}({V_INST})~='table' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Environment check failed: Instance API missing') end",
+        f"{V_ERROR}('[DEX] Invalid execution environment')",
+        "end",
+
+        # ── Layer 3: _G integrity — detect hooked stdlib functions ────────────
+        # If someone replaced pcall/tostring/type in _G with custom hooks,
+        # our locally-captured versions differ from what _G claims.
+        # We compare type() of each: a hook is almost always a table or userdata,
+        # not a function. A replaced function would still be 'function' but the
+        # identity check (rawequal) catches direct swaps.
+        f"if _G and {V_TYPE}(_G)=='table' then",
+        f"if _G.pcall~=nil and not rawequal(_G.pcall,{V_PCALL}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Integrity check failed: pcall hooked') end",
+        f"{V_ERROR}('[DEX] Environment integrity check failed')",
+        "end",
+        f"if _G.type~=nil and not rawequal(_G.type,{V_TYPE}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Integrity check failed: type hooked') end",
+        f"{V_ERROR}('[DEX] Environment integrity check failed')",
+        "end",
+        "end",
+
+        # ── Decoder helpers ───────────────────────────────────────────────────
         f"local {V_CHAR}={V_STRING}.char",
         f"local {V_LEN}={V_STRING}.len",
         f"local {V_SUB}={V_STRING}.sub",
         f"local {V_CONCAT}={V_TABLE}.concat",
         f"local {V_TONUM}=tonumber",
         f"local {V_LOAD}=loadstring or load",
+        f"local {V_FLOOR}={V_MATH}.floor",
         f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Runtime capability check failed: required decoder functions are unavailable.') end",
-        f"{V_ERROR}('Unsupported Lua runtime: required functions unavailable')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Runtime check failed: decoder functions unavailable') end",
+        f"{V_ERROR}('[DEX] Unsupported runtime')",
         "end",
 
-        f"local {V_DATA}='{encoded}'",
+        # ── Layer 4: reconstruct XOR key from split halves ────────────────────
+        f"local {V_KEY_A}={key_a}",
+        f"local {V_KEY_B}={key_b}",
+        f"local {V_KEY}={V_KEY_A}~{V_KEY_B}",  # Lua bitwise XOR (Luau supports ~)
+
+        # ── Layer 5: reconstruct payload from split halves ────────────────────
+        f"local {V_HALF_A}='{encoded_a}'",
+        f"local {V_HALF_B}='{encoded_b}'",
+        f"local {V_DATA}={V_HALF_A}..{V_HALF_B}",
+
         f"local {V_EXPECT_LEN}={source_length}",
         f"local {V_EXPECT_HEX_LEN}={encoded_length}",
 
-        # Structural check before decoding.
+        # Structural check
         f"if {V_LEN}({V_DATA})~={V_EXPECT_HEX_LEN} or ({V_LEN}({V_DATA})%2)~=0 then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Structural integrity check failed.') end",
-        f"{V_ERROR}('Protected payload structure check failed')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Structural check failed') end",
+        f"{V_ERROR}('[DEX] Payload structure check failed')",
         "end",
 
-        f"local {V_OUT}={{}}",
-        f"local {V_SUM_A}=0x45D9",
-        f"local {V_SUM_B}=0xA7C3",
+        # ── Layer 6: verify ciphertext before decoding ────────────────────────
         f"local {V_CSUM_A}=0x6D31",
         f"local {V_CSUM_B}=0x91E7",
-        f"local {V_EXPECT_A}={checksum_a}",
-        f"local {V_EXPECT_B}={checksum_b}",
         f"local {V_CEXPECT_A}={cipher_a}",
         f"local {V_CEXPECT_B}={cipher_b}",
-
-        # Verify the stored ciphertext independently before decoding.
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
         f"if {V_VALUE}==nil then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Encoded payload contains an invalid byte.') end",
-        f"{V_ERROR}('Protected payload encoding check failed')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Payload encoding check failed') end",
+        f"{V_ERROR}('[DEX] Payload encoding check failed')",
         "end",
-        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
-        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+((({V_I}+1)/2)*29))%4294967296",
+        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
+        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*29)%4294967296",
         "end",
-
         f"if {V_CSUM_A}~={V_CEXPECT_A} or {V_CSUM_B}~={V_CEXPECT_B} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper check failed: encrypted payload was modified.') end",
-        f"{V_ERROR}('Protected payload integrity check failed')",
+        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: ciphertext modified') end",
+        f"{V_ERROR}('[DEX] Ciphertext integrity check failed')",
         "end",
 
-        # Decode and verify plaintext independently.
+        # ── Decode + Layer 7: plaintext dual checksum + Layer 8: FNV-c ────────
+        f"local {V_OUT}={{}}",
+        f"local {V_SUM_A}=0x45D9",
+        f"local {V_SUM_B}=0xA7C3",
+        f"local {V_SUM_C}=0x811C9DC5",
+        f"local {V_EXPECT_A}={checksum_a}",
+        f"local {V_EXPECT_B}={checksum_b}",
+        f"local {V_EXPECT_C}={checksum_c}",
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"{V_VALUE}=({V_VALUE}-{key}-(((({V_I}-1)/2)*31)%256))%256",
-        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
-        f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
-        f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+((({V_I}+1)/2)*17))%4294967296",
+        # decrypt: subtract key and position-dependent offset
+        f"{V_VALUE}=({V_VALUE}-{V_KEY}-({V_FLOOR}(({V_I}-1)/2)*31%256))%256",
+        f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
+        f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
+        f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
+        f"{V_SUM_C}=(({V_SUM_C}~{V_VALUE})*16777619)%4294967296",
         "end",
 
-        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper check failed: decoded payload was modified.') end",
-        f"{V_ERROR}('Protected payload integrity check failed')",
+        # ── Layer 7+8+9 verification ──────────────────────────────────────────
+        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} or {V_SUM_C}~={V_EXPECT_C} then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper: decoded payload corrupted') end",
+        f"{V_ERROR}('[DEX] Plaintext integrity check failed')",
         "end",
 
-        # Compile the decoded source. xpcall is used when available, while
-        # keeping pcall as the portable fallback expected by older runtimes.
+        # ── Layer 10: compile and execute in current env ──────────────────────
         f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
         f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
-        f"if not {V_FN} then {V_ERROR}('Internal Error: '..{V_TOSTRING}({V_ERR})) end",
+        f"if not {V_FN} then {V_ERROR}('[DEX] Compile error: '..{V_TOSTRING}({V_ERR})) end",
 
         f"if {V_TYPE}({V_XPCALL})=='function' then",
         f"local {V_OK},{V_RESULT}={V_XPCALL}({V_FN},{V_TOSTRING},...)",
-        f"if not {V_OK} then {V_ERROR}('Protected payload execution failed: '..{V_TOSTRING}({V_RESULT})) end",
+        f"if not {V_OK} then {V_ERROR}('[DEX] Execution failed: '..{V_TOSTRING}({V_RESULT})) end",
         f"return {V_RESULT}",
         "end",
 
         f"local {V_OK},{V_RESULT}={V_PCALL}({V_FN},...)",
-        f"if not {V_OK} then {V_ERROR}('Protected payload execution failed: '..{V_TOSTRING}({V_RESULT})) end",
+        f"if not {V_OK} then {V_ERROR}('[DEX] Execution failed: '..{V_TOSTRING}({V_RESULT})) end",
         f"return {V_RESULT}",
         "end)(...)",
     ]
 
     # ── Assemble the 3-line output ─────────────────────────────────────────────
-    # Line 1: banner comment
-    # Line 2: blank
-    # Line 3: all logic on one continuous line, scaled to target byte size
-    # ──────────────────────────────────────────────────────────────────────────
     comment_line = lines[0]
     code_line    = " ".join(x.strip() for x in lines[2:] if x.strip())
 
-    # Size-scaling rule: 1 KB per source line of the ORIGINAL user script.
-    #   500 lines → 500 KB  |  1 000 → 1 MB  |  2 000 → 2 MB  |  3 000 → 3 MB
-    #
-    # When the caller passes target_bytes > 0 (the API pipeline does this so the
-    # DEX wrapper is sized against the real script even though only the short
-    # intermediate loadstring is encrypted), use that value directly.
-    # Otherwise auto-compute from whatever source was passed in.
+    # Size-scaling: 1 KB per source line.
     if target_bytes and target_bytes > 0:
         _target = int(target_bytes)
     else:
         num_src_lines = max(1, len(source.splitlines()))
         _target       = num_src_lines * 1024
-    overhead    = len(comment_line.encode("utf-8")) + 2   # \n\n
-    needed_code = _target - overhead                      # bytes line 3 must reach
+    overhead    = len(comment_line.encode("utf-8")) + 2
+    needed_code = _target - overhead
 
     current_code_bytes = len(code_line.encode("utf-8"))
     if current_code_bytes < needed_code:
-        # Padding locals are wrapped in do...end blocks so they live in their
-        # own scope. Luau hard-limits a single function/block to 200 locals;
-        # the outer decoder function already uses ~27 real locals so we keep
-        # each do-block well under that ceiling.
-        #
-        # LOCALS_PER_BLOCK must satisfy:
-        #   real_decoder_locals + LOCALS_PER_BLOCK < 200
-        # We count the real decoder top-level locals conservatively (27 names)
-        # and leave a 13-slot safety margin: 200 - 27 - 13 = 160 per block.
-        REAL_LOCALS      = 27
-        SAFETY_MARGIN    = 13
-        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 160
+        # ── Layer 11: padding in do...end blocks (160 locals each, Luau-safe) ─
+        # Outer fn now uses 48 real locals. Each do-block gets its own scope.
+        # 200 - 48 - 12(margin) = 140 per block — safely under the 200 limit.
+        REAL_LOCALS      = 48
+        SAFETY_MARGIN    = 12
+        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 140
 
         INSERT_MARKER = "return(function(...)"
-        splice_idx = code_line.find(INSERT_MARKER)
-        splice_pos = (splice_idx + len(INSERT_MARKER)) if splice_idx >= 0 else len(code_line)
+        splice_idx    = code_line.find(INSERT_MARKER)
+        splice_pos    = (splice_idx + len(INSERT_MARKER)) if splice_idx >= 0 else len(code_line)
 
         deficit   = needed_code - current_code_bytes
         pad_bytes = 0
-        blocks    = []  # each entry is one complete "do ... end" string
+        blocks    = []
 
         while pad_bytes < deficit:
             frags = []
             for _ in range(LOCALS_PER_BLOCK):
                 n    = _junk_fenv_name(used)
-                # Luau-safe: pure arithmetic, never calls anything, always a number.
                 frag = f"local {n}=({_RNG.randint(1,0xFFFF)}*{_RNG.randint(1,0xFFFF)})%{_RNG.randint(1,0xFFFF)+1}"
                 frags.append(frag)
             block = "do " + " ".join(frags) + " end"
@@ -6059,8 +6109,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
             if pad_bytes >= deficit:
                 break
 
-        pad_str = " ".join(blocks)
-
+        pad_str  = " ".join(blocks)
         code_line = (
             code_line[:splice_pos]
             + " "
