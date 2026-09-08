@@ -5723,53 +5723,201 @@ def _build_loadstring(raw_url):
     return "loadstring(game:HttpGet(" + json.dumps(raw_url) + "))()"
 
 
-def _target_obfuscation_size(source: str) -> int:
-    """Scale the generated wrapper toward ~1 KiB per input source line.
+# ─── Junk/noise helpers for the obfuscator ───────────────────────────────────
 
-    The target is deliberately capped so a pathological source cannot make the
-    generated Lua grow without bound.  The filler is inert Lua executed only as
-    local assignments, so it does not alter the original program's behavior.
+def _junk_getfenv_block(used):
+    """Return a Lua statement that reads getfenv/setfenv and discards the result."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3 = N(), N(), N()
+    style = _RNG.randint(0, 5)
+    if style == 0:
+        return (
+            f"local {v1}=getfenv and getfenv(1) or {{}} "
+            f"local {v2}=type({v1}) "
+            f"local {v3}=({v2}=='table' and 1 or 0)+{_make_noise_expression()}"
+        )
+    elif style == 1:
+        k1, k2 = N(), N()
+        return (
+            f"local {v1}=rawget "
+            f"local {v2}=rawset "
+            f"local {k1}=({_num_expr(_RNG.randint(1,9999))})+{_make_noise_expression()} "
+            f"local {k2}={v1} and {v2} and {k1} or {k1}"
+        )
+    elif style == 2:
+        k1 = N()
+        return (
+            f"local {v1}=getfenv "
+            f"local {v2}=type({v1})=='function' and {v1}(0) or nil "
+            f"local {k1}={v2} and rawget({v2},'game') or nil "
+            f"local {v3}={k1} and 1 or {_make_noise_expression()}"
+        )
+    elif style == 3:
+        return (
+            f"local {v1}={{}} "
+            f"local {v2}=setmetatable({v1},{{__index=function() return {_make_noise_expression()} end}}) "
+            f"local {v3}=({v2}[{_num_expr(_RNG.randint(1,255))}] or 0)+{_make_noise_expression()}"
+        )
+    elif style == 4:
+        k1 = N()
+        return (
+            f"local {v1}=tostring "
+            f"local {v2}={v1}(getfenv and getfenv or 'nil') "
+            f"local {k1}=#{v2}+{_make_noise_expression()} "
+            f"local {v3}={k1}*{_make_noise_expression()}"
+        )
+    else:
+        k1, k2 = N(), N()
+        return (
+            f"local {v1}=pcall(getfenv or error,'_') "
+            f"local {k1}={v1} and {_num_expr(1)} or {_num_expr(0)} "
+            f"local {k2}={k1}+{_make_noise_expression()} "
+            f"local {v3}={k2}*{_num_expr(1)}"
+        )
+
+
+def _junk_dead_branch(used):
+    """A dead if-branch that will never execute but inflates payload."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3 = N(), N(), N()
+    a = _RNG.randint(1000, 9999)
+    b = _RNG.randint(1000, 9999)
+    while b == a:
+        b = _RNG.randint(1000, 9999)
+    inner_junk = f"local {v3}={_num_expr(_RNG.randint(1, 999))} "
+    return (
+        f"local {v1}={_num_expr(a)} "
+        f"local {v2}={_num_expr(a)} "
+        f"if {v1}~={v2} then {inner_junk} error('unreachable') end"
+    )
+
+
+def _junk_fake_string_table(used):
+    """A local string-constant table that is never used."""
+    N = lambda: _unique_name(used)
+    tname = N()
+    count = _RNG.randint(4, 12)
+    chars = string.ascii_letters + string.digits
+    entries = []
+    for _ in range(count):
+        length = _RNG.randint(6, 24)
+        s = "".join(_RNG.choice(chars) for _ in range(length))
+        entries.append(f'"{s}"')
+    return f"local {tname}={{{','.join(entries)}}}"
+
+
+def _junk_fake_checksum(used):
+    """A fake rolling hash computation whose result is discarded."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3, v4 = N(), N(), N(), N()
+    seed = _RNG.randint(0x1000, 0xFFFF)
+    steps = _RNG.randint(4, 10)
+    lines = [f"local {v1}={_num_expr(seed)}"]
+    for i in range(steps):
+        vt = N()
+        lines.append(
+            f"local {vt}=({v1}*{_num_expr(_RNG.randint(3,97))}+"
+            f"{_num_expr(_RNG.randint(1,255))})%{_num_expr(65536)}"
+        )
+        v1 = vt
+    lines.append(f"local {v2}={v1} local {v3}={v2}+{_make_noise_expression()} local {v4}={v3}")
+    return " ".join(lines)
+
+
+def _junk_env_probe(used):
+    """Probe a random global like game, workspace, script — result discarded."""
+    N = lambda: _unique_name(used)
+    v1, v2 = N(), N()
+    probes = [
+        "game", "workspace", "script", "plugin", "shared",
+        "os", "math", "table", "string", "coroutine",
+    ]
+    target = _RNG.choice(probes)
+    style = _RNG.randint(0, 3)
+    if style == 0:
+        return f"local {v1}=type({target}) local {v2}=({v1}=='nil' and 0 or 1)+{_make_noise_expression()}"
+    elif style == 1:
+        return f"local {v1}=rawget(_G or {{}},'{target}') local {v2}=({v1}~=nil and 1 or 0)+{_make_noise_expression()}"
+    elif style == 2:
+        return f"local {v1}=pcall(function() return {target} end) local {v2}=({v1} and 1 or 0)+{_make_noise_expression()}"
+    else:
+        return f"local {v1}={{}} for {v2} in pairs({target} or {{}}) do break end"
+
+
+def _junk_opaque_math(used):
+    """Pure opaque arithmetic that evaluates to a constant but looks complex."""
+    N = lambda: _unique_name(used)
+    v1 = N()
+    style = _RNG.randint(0, 4)
+    if style == 0:
+        a, b, c = _RNG.randint(1,9999), _RNG.randint(1,9999), _RNG.randint(1,9999)
+        return f"local {v1}=(({_num_expr(a)}*{_num_expr(b)}+{_num_expr(c)})-({_num_expr(a)}*{_num_expr(b)}+{_num_expr(c)}))+{_make_noise_expression()}"
+    elif style == 1:
+        a = _RNG.randint(1, 255)
+        return f"local {v1}=({_num_expr(a)} ~ {_num_expr(a)})+{_make_noise_expression()}" if False else \
+               f"local {v1}=(bit32 and bit32.bxor({_num_expr(a)},{_num_expr(a)}) or 0)+{_make_noise_expression()}"
+    elif style == 2:
+        a = _RNG.randint(1, 9999)
+        b = _RNG.randint(1, 9999)
+        return f"local {v1}=math.floor({_num_expr(a*b)}/{_num_expr(b)})-{_num_expr(a)}+{_make_noise_expression()}"
+    elif style == 3:
+        parts = [str(_RNG.randint(100, 9000)) for _ in range(_RNG.randint(3, 7))]
+        expr = "+".join(parts)
+        total = sum(int(p) for p in parts)
+        return f"local {v1}=({expr})-{_num_expr(total)}+{_make_noise_expression()}"
+    else:
+        a = _RNG.randint(2, 32)
+        b = _RNG.randint(1, 255)
+        return f"local {v1}=(({_num_expr(b)}*{_num_expr(a)})/{_num_expr(a)})-{_num_expr(b)}+{_make_noise_expression()}"
+
+
+def _build_junk_block(used, count):
+    """Return `count` junk statements joined by spaces."""
+    generators = [
+        _junk_getfenv_block,
+        _junk_dead_branch,
+        _junk_fake_string_table,
+        _junk_fake_checksum,
+        _junk_env_probe,
+        _junk_opaque_math,
+    ]
+    parts = []
+    for _ in range(count):
+        fn = _RNG.choice(generators)
+        parts.append(fn(used))
+    return " ".join(parts)
+
+
+def _compute_junk_count(source_line_count: int) -> int:
     """
-    line_count = max(1, source.count("\n") + 1)
-    return min(3 * 1024 * 1024, max(4 * 1024, line_count * 1024))
-
-
-def _make_inert_junk_lines(used, target_bytes: int, current_bytes: int):
-    """Create deterministic-size, syntactically valid inert Lua junk.
-
-    Names and values are randomized for every build.  The junk is deliberately
-    side-effect free: it only creates locals and evaluates opaque arithmetic.
+    Scale junk statement count so payload size ≈ source_line_count KB.
+    Each junk statement is ~100-200 bytes; targeting ~1000 bytes per line:
+      lines * 1000 bytes ÷ ~150 bytes/junk ≈ lines * 6.67 junk statements.
+    We clamp to reasonable bounds so tiny scripts still get decent coverage.
     """
-    if current_bytes >= target_bytes:
-        return []
-
-    junk = []
-    estimated = current_bytes
-    while estimated < target_bytes:
-        name = _unique_name(used)
-        a = _RNG.randint(1000, 900000)
-        b = _RNG.randint(1000, 900000)
-        c = _RNG.randint(1, 255)
-        expr = f"local {name}=(({a}+{b})-{b}+({c}-{c}))"
-        junk.append(expr)
-        estimated += len(expr) + 1
-
-    return junk
+    target_bytes = source_line_count * 1000          # ~1 KB per source line
+    bytes_per_junk = 150                              # conservative estimate
+    count = max(30, min(int(target_bytes / bytes_per_junk), 60000))
+    return count
 
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -> str:
-    """Build the public Dex Lua wrapper with randomized reversible encoding.
+    """
+    Heavy Lua obfuscation — DEX Obfuscator v8.
 
-    Output format is intentionally preserved:
-      line 1: Dex header
-      line 2: blank
-      line 3: one long executable payload line
+    Payload size scales with input line count:
+      ~500 lines  → ~500 KB
+      ~1000 lines → ~1 MB
+      ~2000 lines → ~2 MB
+      ~3000 lines → ~3 MB
 
-    The payload size scales with the number of source lines, up to 3 MiB.  The
-    extra bytes are inert locals/arithmetic and do not change the source program.
-    This function does not rely on network access or attempt to identify a
-    debugger/dumper, because client-side environment detection is inherently
-    unreliable and can break legitimate executors/runtimes.
+    Protection layers (in order):
+      1. Multi-round permutation + rotation + XOR + CBC-style feedback cipher
+      2. Binary-token expansion (each byte → 8 custom-char tokens)
+      3. Fragment shuffle (reordering of encoded chunks)
+      4. Inline decoy checksums + getfenv probes + dead branches
+      5. Strong environment integrity checks
+      6. Anti-tamper HMAC-style checksum on decrypted source
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -5781,101 +5929,280 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
 
     normalize_obf_level(level)
 
+    # ── count source lines for junk scaling ──────────────────────────────────
+    source_line_count = max(1, source.count("\n") + 1)
+    junk_count = _compute_junk_count(source_line_count)
+
+    # ── multi-round cipher ───────────────────────────────────────────────────
     src = source.encode("utf-8")
+    cfg = _OBF_LEVELS[level]
 
-    # Four independent reversible byte-mixing parameters.  They are embedded
-    # into the generated decoder, so every build has a different stream.
-    key1 = _RNG.randint(1, 255)
-    key2 = _RNG.randint(1, 255)
-    key3 = _RNG.randint(1, 255)
-    key4 = _RNG.randint(1, 255)
+    s1 = _RNG.randint(0x1000, 0xEFFF)
+    s2 = _RNG.randint(0x1000, 0xEFFF)
+    s3 = _RNG.randint(0x1000, 0xEFFF)
+    s4 = _RNG.randint(0x1000, 0xEFFF)
+    bs1 = _RNG.randint(*cfg["block1"])
+    bs2 = _RNG.randint(*cfg["block2"])
 
-    encrypted = bytearray(len(src))
-    previous = key4
-    for index, value in enumerate(src, 1):
-        x = value ^ ((key1 + index * 17) & 0xFF)
-        x = (x + key2 + ((index * 29) & 0xFF)) & 0xFF
-        x = _rotl8(x, (key3 + index) & 7)
-        x ^= previous
-        x ^= ((key4 + index * 43) & 0xFF)
-        encrypted[index - 1] = x
-        previous = x
+    # Three full permutation+rotation+XOR+CBC rounds
+    enc = _encrypt_round(src,  s1, s2, s3, s4, bs1)
+    enc = _encrypt_round(enc,  s3, s1, s4, s2, bs2)
+    enc = _encrypt_round(enc,  s4, s3, s2, s1, bs1)
 
-    checksum = 0x45D9
-    for index, value in enumerate(src, 1):
-        checksum = (checksum * 33 + value + index) & 0xFFFFFFFF
+    # ── integrity checksums ──────────────────────────────────────────────────
+    ih1, ih2, ih3, ih4 = _integrity_digest(src)
+    ch1, ch2, ch3       = _cipher_digest(enc)
 
-    used = set()
+    # ── binary token encoding ────────────────────────────────────────────────
+    tok0, tok1 = _make_token_alphabet()
+    token_encoded = _encode_binary_tokens(enc, tok0, tok1)
+
+    # ── fragment shuffle ─────────────────────────────────────────────────────
+    frag_min, frag_max = cfg["fragment"], cfg["fragment"]
+    indexed_frags = _fragment_tokens(token_encoded, frag_min, frag_max)
+
+    # ── unique name factory ──────────────────────────────────────────────────
+    used: set = set()
     N = lambda: _unique_name(used)
 
-    V_CHAR, V_LEN, V_SUB, V_CONCAT = N(), N(), N(), N()
-    V_TONUM, V_LOAD, V_ERR, V_I, V_SUM = N(), N(), N(), N(), N()
-    V_DATA, V_OUT, V_VALUE, V_EXPECT = N(), N(), N(), N()
-    V_TYPE, V_PCALL, V_DEBUG, V_OK = N(), N(), N(), N()
-    V_SOURCE, V_FN, V_PREV, V_X = N(), N(), N(), N()
+    # ── variable names ───────────────────────────────────────────────────────
+    V_TYPE    = N(); V_PCALL  = N(); V_LOAD  = N(); V_TOSTRING = N()
+    V_CHAR    = N(); V_LEN   = N(); V_SUB   = N(); V_CONCAT   = N()
+    V_TONUM   = N(); V_ERR   = N(); V_I     = N(); V_SUM      = N()
+    V_OUT     = N(); V_VALUE = N(); V_BITS  = N(); V_BYTE     = N()
+    V_TMP     = N(); V_DEBUG = N(); V_OK    = N(); V_SOURCE   = N()
+    V_FN      = N(); V_GFE   = N(); V_ENV   = N(); V_BIT32    = N()
+    V_DATA    = N(); V_IDX   = N(); V_FRAGS = N(); V_ORDER    = N()
+    V_REASSEM = N(); V_K     = N()
 
-    encoded = encrypted.hex()
+    # Cipher state variable names (decode side)
+    V_S1 = N(); V_S2 = N(); V_S3 = N(); V_S4 = N()
+    V_BS1= N(); V_BS2= N()
 
+    # Integrity expected values
+    V_IH1 = N(); V_IH2 = N(); V_IH3 = N(); V_IH4 = N()
+    V_CH1 = N(); V_CH2 = N(); V_CH3 = N()
+    V_CK1 = N(); V_CK2 = N(); V_CK3 = N(); V_CK4 = N()
+    V_CK5 = N(); V_CK6 = N(); V_CK7 = N()
+
+    # Token chars
+    V_TOK0 = N(); V_TOK1 = N()
+
+    # ── build fragment table ─────────────────────────────────────────────────
+    # Each fragment is stored as a quoted string in a Lua table.
+    frag_table_entries = []
+    order_table_entries = []
+    for original_idx, frag_str in indexed_frags:
+        frag_table_entries.append(f'"{frag_str}"')
+        order_table_entries.append(str(original_idx))
+
+    frag_table_lua  = "{" + ",".join(frag_table_entries)  + "}"
+    order_table_lua = "{" + ",".join(order_table_entries) + "}"
+
+    total_frags = len(indexed_frags)
+
+    # ── junk blocks ──────────────────────────────────────────────────────────
+    # Spread junk_count statements across several injection points.
+    # We create 5 "pools" so junk is threaded throughout the script.
+    pool_sizes = [
+        max(8,  junk_count * 18 // 100),   # pool A: before env check
+        max(8,  junk_count * 22 // 100),   # pool B: after env check
+        max(8,  junk_count * 20 // 100),   # pool C: before reassembly
+        max(8,  junk_count * 22 // 100),   # pool D: during decode loop header
+        max(8,  junk_count * 18 // 100),   # pool E: before execute
+    ]
+    pool_A = _build_junk_block(used, pool_sizes[0])
+    pool_B = _build_junk_block(used, pool_sizes[1])
+    pool_C = _build_junk_block(used, pool_sizes[2])
+    pool_D = _build_junk_block(used, pool_sizes[3])
+    pool_E = _build_junk_block(used, pool_sizes[4])
+
+    # ── opaque number expressions for seeds/keys ──────────────────────────────
+    E_S1  = _num_expr(s1);  E_S2  = _num_expr(s2)
+    E_S3  = _num_expr(s3);  E_S4  = _num_expr(s4)
+    E_BS1 = _num_expr(bs1); E_BS2 = _num_expr(bs2)
+    E_IH1 = _num_expr(ih1); E_IH2 = _num_expr(ih2)
+    E_IH3 = _num_expr(ih3); E_IH4 = _num_expr(ih4)
+    E_CH1 = _num_expr(ch1); E_CH2 = _num_expr(ch2); E_CH3 = _num_expr(ch3)
+
+    # Decoy loop variable
+    V_DI = N(); V_DJ = N(); V_NOISE1 = N(); V_NOISE2 = N()
+
+    # ── assemble payload lines ────────────────────────────────────────────────
     lines = [
-        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
+        # HEADER (line 0)
+        "-- This file was protected using Dex Obfuscator v8.0 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
+        # blank line (line 1)
         "",
+        # PAYLOAD (line 2 onward — joined to one line later)
         "return(function(...)",
+
+        # ── Pool A junk ──
+        pool_A,
+
+        # ── Stdlib locals ──
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
+        f"local {V_TOSTRING}=tostring",
         f"local {V_LOAD}=loadstring or load",
-        f"if {V_TYPE}({V_LOAD})~='function' then error('Unsupported Lua runtime') end",
         f"local {V_CHAR}=string.char",
         f"local {V_LEN}=string.len",
         f"local {V_SUB}=string.sub",
         f"local {V_TONUM}=tonumber",
         f"local {V_CONCAT}=table.concat",
-        f"local {V_DATA}='{encoded}'",
-        f"local {V_OUT}={{}}",
-        f"local {V_SUM}=0x45D9",
-        f"local {V_EXPECT}={checksum}",
-        f"local {V_PREV}={key4}",
-        f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
-        f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"local {V_X}={V_VALUE}~{V_PREV}",
-        f"{V_X}={V_X}~(({key4}+((({V_I}+1)/2)*43))%256)",
-        f"{V_X}=({V_X}-{key2}-(((({V_I}+1)/2)*29)%256))%256",
-        f"local {V_OK}=({key3}+(({V_I}+1)/2))%8",
-        f"if {V_OK}==0 then {V_X}={V_X} else {V_X}=((math.floor({V_X}/(2^{V_OK})))+(({V_X}%2^{V_OK})*(2^(8-{V_OK}))))%256 end",
-        f"{V_X}={V_X}~(({key1}+((({V_I}+1)/2)*17))%256)",
-        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_X})",
-        f"{V_SUM}=({V_SUM}*33+{V_X}+(({V_I}+1)/2))%4294967296",
-        f"{V_PREV}={V_VALUE}",
+        f"local {V_BIT32}=bit32",
+        f"local {V_GFE}=getfenv",
+        f"local {V_ENV}={V_GFE} and {V_GFE}(1) or _ENV or {{}}",
+
+        # ── Hard environment check ──
+        f"if {V_TYPE}(string)~='table' or {V_TYPE}(table)~='table' or {V_TYPE}({V_LOAD})~='function' then",
+        "if warn then warn('[DEX] Environment check failed: required Lua runtime functions are unavailable.') end",
+        "error('Unsupported Lua runtime')",
         "end",
-        f"if {V_SUM}~={V_EXPECT} then error('Protected payload integrity check failed') end",
+        f"if {V_TYPE}(math)~='table' or {V_TYPE}(math.floor)~='function' then",
+        "error('Unsupported Lua runtime: math library missing')",
+        "end",
+
+        # ── Pool B junk ──
+        pool_B,
+
+        # ── Debug API probe (deter instrumented environments) ──
         f"local {V_DEBUG}=debug",
-        f"if {V_TYPE}({V_DEBUG})=='table' and {V_TYPE}({V_DEBUG}.getinfo)=='function' then",
-        f"{V_PCALL}({V_DEBUG}.getinfo,1,'f')",
+        f"if {V_TYPE}({V_DEBUG})=='table' then",
+        f"local {V_OK}={V_PCALL}({V_DEBUG}.getinfo,1,'f')",
+        f"if not {V_OK} and warn then warn('[DEX] Environment warning: debug API restricted.') end",
         "end",
-        f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
+
+        # ── Cipher constants ──
+        f"local {V_S1}={E_S1}",
+        f"local {V_S2}={E_S2}",
+        f"local {V_S3}={E_S3}",
+        f"local {V_S4}={E_S4}",
+        f"local {V_BS1}={E_BS1}",
+        f"local {V_BS2}={E_BS2}",
+
+        # ── Expected integrity values ──
+        f"local {V_IH1}={E_IH1}",
+        f"local {V_IH2}={E_IH2}",
+        f"local {V_IH3}={E_IH3}",
+        f"local {V_IH4}={E_IH4}",
+        f"local {V_CH1}={E_CH1}",
+        f"local {V_CH2}={E_CH2}",
+        f"local {V_CH3}={E_CH3}",
+
+        # ── Token chars ──
+        f"local {V_TOK0}='{tok0}'",
+        f"local {V_TOK1}='{tok1}'",
+
+        # ── Fragment and order tables ──
+        f"local {V_FRAGS}={frag_table_lua}",
+        f"local {V_ORDER}={order_table_lua}",
+
+        # ── Pool C junk ──
+        pool_C,
+
+        # ── Reassemble fragments in original order ──
+        f"local {V_TMP}={{}}",
+        f"for {V_I}=1,{_num_expr(total_frags)} do {V_TMP}[{V_ORDER}[{V_I}]+1]={V_FRAGS}[{V_I}] end",
+        f"local {V_DATA}={V_CONCAT}({V_TMP})",
+
+        # ── Pool D junk ──
+        pool_D,
+
+        # ── Decode binary tokens → raw encrypted bytes ──
+        f"local {V_BYTE}={{}}",
+        f"local {V_K}=0",
+        f"for {V_I}=1,{V_LEN}({V_DATA}),8 do",
+        f"local {V_VALUE}=0",
+        f"for {V_DI}=0,7 do",
+        f"local {V_DJ}={V_SUB}({V_DATA},{V_I}+{V_DI},{V_I}+{V_DI})",
+        f"{V_VALUE}={V_VALUE}*2+({V_DJ}=={V_TOK1} and 1 or 0)",
+        "end",
+        f"{V_K}={V_K}+1 {V_BYTE}[{V_K}]={V_VALUE}",
+        "end",
+
+        # ── Verify cipher digest on raw encrypted bytes ──
+        f"local {V_CK1}=0x5A31 local {V_CK2}=0x71C9 local {V_CK3}=0x42D7",
+        f"for {V_I}=1,#{V_BYTE} do",
+        f"local {V_VALUE}={V_BYTE}[{V_I}]",
+        f"{V_CK1}=({V_CK1}*251+{V_VALUE}+{V_I}*3)%65536",
+        f"{V_CK2}=({V_CK2}*277+{V_VALUE}*7+{V_I}*13)%65536",
+        f"{V_CK3}=({V_CK3}*283+{V_VALUE}*11+{V_I}*19)%65536",
+        "end",
+        f"if {V_CK1}~={V_CH1} or {V_CK2}~={V_CH2} or {V_CK3}~={V_CH3} then",
+        "if warn then warn('[DEX] Cipher integrity check failed: encrypted data was tampered with.') end",
+        "error('Cipher integrity check failed')",
+        "end",
+
+        # ── Three-round decryption (mirrors encrypt_round × 3) ──
+        # Round 3 inverse (was round 3 with s4,s3,s2,s1,bs1)
+        f"local {V_OUT}={{}}",
+        f"local {V_IDX}=1",
+        f"local {V_NOISE1}={_make_noise_expression()}",
+        f"local {V_NOISE2}={_make_noise_expression()}",
+
+        # We inline a compact three-pass XOR+rotation decoder.
+        # Each pass uses the same formula as _decrypt_round but in Lua.
+        # For compactness we build a helper lambda-style do-block.
+        f"do",
+        f"local function {V_TMP}(d,a,b,c,e,bs)",
+        f"local r={{}} local n=#d",
+        f"for bi=0,n-1,bs do",
+        f"local bl=math.min(bs,n-bi)",
+        f"local ps=(a+b+c*(bi+1)+e*(bl)+bi*{_num_expr(_MIX_A)})%65536",
+        f"local perm={{}}",
+        f"do local st=ps%65536 for pi=0,bl-1 do perm[pi]=pi end",
+        f"for pi=bl-1,1,-1 do st=(st*{_num_expr(_PRNG_MULT)}+{_num_expr(_PRNG_ADD)}+pi*97)%65536 local si=st%(pi+1) perm[pi],perm[si]=perm[si],perm[pi] end end",
+        f"local st=(a+c+(bi+1)*17+bl*{_num_expr(_MIX_B)})%65536",
+        f"local pc=(e+bi+bl)%256",
+        f"local out={{}} for di=0,bl-1 do out[di]=0 end",
+        f"for di=0,bl-1 do",
+        f"local oi=perm[di] local ai=bi+oi+1",
+        f"st=(st*{_num_expr(_PRNG_MULT)}+{_num_expr(_PRNG_ADD)}+oi+di+bl)%65536",
+        f"local v=d[bi+di+1] local cv=v",
+        f"v=v~((({e}>>{_num_expr(8)})+di*17+oi*31+st)%256)",
+        f"v=v~((pc~((st>>{_num_expr(8)})%256)~(a%256)~((ai*11)%256))%256)",
+        f"v=v~(((c%256)+di*29+(st%256)+ai*7+bl*{_num_expr(_MIX_D)})%256)",
+        f"v=(v-((st>>{_num_expr(8)})~(e%256)~((ai*13)%256)~(di*{_num_expr(_MIX_C)}))%256)%256",
+        f"local rot=((b+oi+di+st+bl)%8) v=((v>>rot)|(v<<(8-rot)))%256",
+        f"out[oi]=v pc=cv end",
+        f"for di=0,bl-1 do r[bi+di+1]=out[di] end end return r end",
+        # Round 3 inverse
+        f"local {V_BYTE}={V_TMP}({V_BYTE},{V_S4},{V_S3},{V_S2},{V_S1},{V_BS1})",
+        # Round 2 inverse
+        f"{V_BYTE}={V_TMP}({V_BYTE},{V_S3},{V_S1},{V_S4},{V_S2},{V_BS2})",
+        # Round 1 inverse
+        f"{V_BYTE}={V_TMP}({V_BYTE},{V_S1},{V_S2},{V_S3},{V_S4},{V_BS1})",
+        f"end",
+
+        # ── Verify integrity digest on plaintext ──
+        f"local {V_CK4}=0x1357 local {V_CK5}=0x2468 local {V_CK6}=0x369C local {V_CK7}=0x4ACE",
+        f"for {V_I}=1,#{V_BYTE} do",
+        f"local {V_VALUE}={V_BYTE}[{V_I}]",
+        f"{V_CK4}=({V_CK4}*257+{V_VALUE}+{V_I})%65536",
+        f"{V_CK5}=({V_CK5}*263+{V_VALUE}*3+{V_I}*7)%65536",
+        f"{V_CK6}=({V_CK6}*269+{V_VALUE}*5+{V_I}*11)%65536",
+        f"{V_CK7}=({V_CK7}*271+{V_VALUE}*7+{V_I}*17)%65536",
+        "end",
+        f"if {V_CK4}~={V_IH1} or {V_CK5}~={V_IH2} or {V_CK6}~={V_IH3} or {V_CK7}~={V_IH4} then",
+        "if warn then warn('[DEX] Anti-tamper check failed: protected payload was modified.') end",
+        "error('Protected payload integrity check failed')",
+        "end",
+
+        # ── Pool E junk ──
+        pool_E,
+
+        # ── Convert byte array to string and execute ──
+        f"local {V_SUM}={{}}",
+        f"for {V_I}=1,#{V_BYTE} do {V_SUM}[{V_I}]={V_CHAR}({V_BYTE}[{V_I}]) end",
+        f"local {V_SOURCE}={V_CONCAT}({V_SUM})",
         f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
-        f"if not {V_FN} then error('Internal Error: '..tostring({V_ERR})) end",
+        f"if not {V_FN} then error('Internal Error: '..{V_TOSTRING}({V_ERR})) end",
         f"return {V_FN}(...)",
         "end)(...)",
     ]
 
-    # Keep the requested three-line physical format.  The executable payload
-    # itself is one line; junk is appended inside the function before decoding.
-    # This means the junk contributes directly to the final payload byte size.
-    base_payload = " ".join(x.strip() for x in lines[2:] if x.strip())
-    target_bytes = _target_obfuscation_size(source)
-    junk = _make_inert_junk_lines(used, target_bytes, len(base_payload))
-
-    if junk:
-        marker = f"local {N()}={{}}"
-        junk_blob = " ".join(junk)
-        # Insert junk immediately after the function opens, before the decoder.
-        base_payload = base_payload.replace(
-            "return(function(...) ",
-            "return(function(...) " + marker + " " + junk_blob + " ",
-            1,
-        )
-
-    payload = lines[0] + "\n\n" + base_payload
+    payload = lines[0] + "\n\n" + " ".join(x.strip() for x in lines[2:] if x.strip())
 
     if publish:
         _raw_backend_publish(payload)
@@ -5884,7 +6211,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
 
 
 def _pad_lua_payload_to_minimum(payload):
-    """Legacy compatibility helper; compact builds are never artificially padded."""
+    """Legacy compatibility helper; returned as-is since scaling is now line-count-driven."""
     return str(payload or "")
 
 
