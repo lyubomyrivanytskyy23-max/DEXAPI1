@@ -6317,7 +6317,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local {V_DEBUG}=debug",
         f"if {V_TYPE}({V_DEBUG})=='table' then",
         f"local {V_OK}={V_PCALL}({V_DEBUG}.getinfo,1,'f')",
-        f"if not {V_OK} and warn then warn('[DEX] Environment warning: debug API restricted.') end",
+        f"if not {V_OK} and warn then warn('[DEX] Restricted') end",
         "end",
 
         # ── Cipher constants ──
