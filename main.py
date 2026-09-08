@@ -5725,18 +5725,12 @@ def _build_loadstring(raw_url):
 
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -> str:
     """
-    Compact compatibility-oriented Lua protection wrapper.
+    High-integrity DEX wrapper.
 
-    Strengthened outer layer:
-      - encrypted payload length validation
-      - independent plaintext checksum
-      - independent ciphertext checksum
-      - structural/runtime capability checks
-      - protected decoder constants captured locally
-      - protected execution through pcall with useful failure messages
-
-    This deliberately avoids executor-specific detection or anti-analysis tricks:
-    client-side Lua can still be inspected by the environment executing it.
+    This layer is intentionally focused on compatibility, tamper detection,
+    layered reversible encoding, and fail-closed execution.  It is not a
+    cryptographic guarantee against an operator of the Lua runtime: anything
+    that must execute client-side can ultimately be observed there.
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -5746,76 +5740,66 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
     if not source:
         raise ValueError("Lua source is empty.")
 
-    normalize_obf_level(level)
-
+    level_name = normalize_obf_level(level)
     src = source.encode("utf-8")
-    key = _RNG.randint(1, 255)
 
-    # Compact reversible byte stream.
-    encrypted = bytes(
-        (value + key + ((index * 31) & 0xFF)) & 0xFF
-        for index, value in enumerate(src)
-    )
+    # More rounds for harder modes, while keeping the final loader reasonably
+    # small because this layer only protects the short intermediate loadstring.
+    round_count = {"light": 2, "medium": 4, "hard": 6}[level_name]
+    keys = [_RNG.randint(1, 255) for _ in range(round_count)]
+    salts = [_RNG.randint(0, 255) for _ in range(round_count)]
 
-    # Two independent integrity values make accidental/casual modification
-    # substantially easier to detect than relying on one accumulator.
-    checksum_a = 0x45D9
-    checksum_b = 0xA7C3
-    for index, value in enumerate(src, 1):
-        checksum_a = (checksum_a * 33 + value + index) & 0xFFFFFFFF
-        checksum_b = (checksum_b * 65599 + value + (index * 17)) & 0xFFFFFFFF
+    # Layered byte transform.  Every round is independently reversible and
+    # uses position-dependent state, so a single-byte edit propagates through
+    # the following bytes in that round.
+    data = bytearray(src)
+    for r in range(round_count):
+        key = keys[r]
+        salt = salts[r]
+        prev = (key ^ salt ^ ((r + 1) * 37)) & 0xFF
+        out = bytearray(len(data))
+        for i, value in enumerate(data):
+            rot = (key + salt + i * 5 + r * 3) & 7
+            x = _rotl8(value, rot)
+            mix = (key + salt + ((i + 1) * 29) + (prev * 17) + (r * 41)) & 0xFF
+            x = (x + mix) & 0xFF
+            x ^= ((key * 13 + salt * 7 + i * 11 + r * 19) & 0xFF)
+            out[i] = x
+            prev = x
+        data = out
 
-    cipher_a = 0x6D31
-    cipher_b = 0x91E7
-    for index, value in enumerate(encrypted, 1):
-        cipher_a = (cipher_a * 33 + value + index) & 0xFFFFFFFF
-        cipher_b = (cipher_b * 65599 + value + (index * 29)) & 0xFFFFFFFF
-
-    source_length = len(src)
-    encoded = encrypted.hex()
-    encoded_length = len(encoded)
+    # Four independent integrity families: plaintext, ciphertext, length and
+    # a position-sensitive rolling tag.  These are tamper detectors, not a
+    # substitute for a cryptographic signature with a server-held secret.
+    plain_a, plain_b, plain_c, plain_d = _integrity_digest(src)
+    cipher_a, cipher_b, cipher_c = _cipher_digest(data)
+    rolling = 0xA5C3
+    for i, value in enumerate(data, 1):
+        rolling = (rolling * 109 + value * 31 + i * 23) & 0xFFFFFFFF
+    rolling = (rolling + (len(src) * 0x45D9)) & 0xFFFFFFFF
 
     used = set()
     N = lambda: _unique_name(used)
 
-    V_TYPE = N()
-    V_PCALL = N()
-    V_XPCALL = N()
-    V_TOSTRING = N()
-    V_ERROR = N()
-    V_WARN = N()
-
-    V_STRING = N()
-    V_TABLE = N()
-    V_CHAR = N()
-    V_LEN = N()
-    V_SUB = N()
-    V_CONCAT = N()
-    V_TONUM = N()
-
-    V_LOAD = N()
-    V_DATA = N()
-    V_OUT = N()
-    V_VALUE = N()
-    V_I = N()
-
-    V_SUM_A = N()
-    V_SUM_B = N()
-    V_EXPECT_A = N()
-    V_EXPECT_B = N()
-    V_CSUM_A = N()
-    V_CSUM_B = N()
-    V_CEXPECT_A = N()
-    V_CEXPECT_B = N()
-
+    V_TYPE, V_PCALL, V_XPCALL, V_LOAD = N(), N(), N(), N()
+    V_FLOOR = N()
+    V_STRING, V_TABLE = N(), N()
+    V_CHAR, V_LEN, V_SUB, V_CONCAT, V_TONUM = N(), N(), N(), N(), N()
+    V_DATA, V_OUT, V_VALUE, V_I, V_J, V_PREV = N(), N(), N(), N(), N(), N()
+    V_SRC, V_FN, V_ERR, V_OK = N(), N(), N(), N()
+    V_PA, V_PB, V_PC, V_PD = N(), N(), N(), N()
+    V_CA, V_CB, V_CC, V_CR = N(), N(), N(), N()
     V_EXPECT_LEN = N()
-    V_EXPECT_HEX_LEN = N()
-    V_SOURCE = N()
-    V_FN = N()
-    V_ERR = N()
-    V_OK = N()
-    V_RESULT = N()
+    V_TAG = N()
+    V_KEY = N(); V_SALT = N(); V_ROT = N(); V_MIX = N(); V_X = N()
+    V_STATUS = N(); V_RUNERR = N(); V_A = N(); V_B = N(); V_XOR = N(); V_BIT = N(); V_RES = N()
 
+    encoded = bytes(data).hex()
+    key_lua = "{" + ",".join(str(x) for x in keys) + "}"
+    salt_lua = "{" + ",".join(str(x) for x in salts) + "}"
+
+    # Keep numbers in ordinary decimal form here.  The payload bytes themselves
+    # are still opaque hex and all identifiers are randomized per build.
     lines = [
         "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
@@ -5823,102 +5807,104 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False) -
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
         f"local {V_XPCALL}=xpcall",
-        f"local {V_TOSTRING}=tostring",
-        f"local {V_ERROR}=error",
-        f"local {V_WARN}=warn",
         f"local {V_STRING}=string",
         f"local {V_TABLE}=table",
-        f"if {V_TYPE}({V_STRING})~='table' or {V_TYPE}({V_TABLE})~='table' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Runtime capability check failed.') end",
-        f"{V_ERROR}('Unsupported Lua runtime: string/table unavailable')",
-        "end",
+        f"local {V_LOAD}=loadstring or load",
+        f"local {V_FLOOR}=math.floor",
+        f"if {V_TYPE}({V_STRING})~='table' or {V_TYPE}({V_TABLE})~='table' or {V_TYPE}({V_LOAD})~='function' then error('Unsupported Lua runtime') end",
+        f"if {V_TYPE}({V_STRING}.char)~='function' or {V_TYPE}({V_STRING}.len)~='function' or {V_TYPE}({V_STRING}.sub)~='function' then error('Unsupported Lua runtime') end",
+        f"if {V_TYPE}({V_TABLE}.concat)~='function' or {V_TYPE}(tonumber)~='function' then error('Unsupported Lua runtime') end",
         f"local {V_CHAR}={V_STRING}.char",
         f"local {V_LEN}={V_STRING}.len",
         f"local {V_SUB}={V_STRING}.sub",
         f"local {V_CONCAT}={V_TABLE}.concat",
         f"local {V_TONUM}=tonumber",
-        f"local {V_LOAD}=loadstring or load",
-        f"if {V_TYPE}({V_CHAR})~='function' or {V_TYPE}({V_LEN})~='function' or {V_TYPE}({V_SUB})~='function' or {V_TYPE}({V_CONCAT})~='function' or {V_TYPE}({V_TONUM})~='function' or {V_TYPE}({V_LOAD})~='function' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Runtime capability check failed: required decoder functions are unavailable.') end",
-        f"{V_ERROR}('Unsupported Lua runtime: required functions unavailable')",
-        "end",
-
+        f"local function {V_XOR}({V_A},{V_B}) local {V_RES}=0; local {V_BIT}=1; for {V_J}=1,8 do local aa={V_A}%2; local bb={V_B}%2; if aa~=bb then {V_RES}={V_RES}+{V_BIT} end; {V_A}=({V_A}-aa)/2; {V_B}=({V_B}-bb)/2; {V_BIT}={V_BIT}*2 end; return {V_RES} end",
         f"local {V_DATA}='{encoded}'",
-        f"local {V_EXPECT_LEN}={source_length}",
-        f"local {V_EXPECT_HEX_LEN}={encoded_length}",
-
-        # Structural check before decoding.
-        f"if {V_LEN}({V_DATA})~={V_EXPECT_HEX_LEN} or ({V_LEN}({V_DATA})%2)~=0 then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Structural integrity check failed.') end",
-        f"{V_ERROR}('Protected payload structure check failed')",
-        "end",
-
+        f"local {V_EXPECT_LEN}={len(src)}",
+        f"local {V_PA}={plain_a}; local {V_PB}={plain_b}; local {V_PC}={plain_c}; local {V_PD}={plain_d}",
+        f"local {V_CA}={cipher_a}; local {V_CB}={cipher_b}; local {V_CC}={cipher_c}; local {V_CR}={rolling}",
+        f"if {V_LEN}({V_DATA})%2~=0 then error('Protected payload encoding invalid') end",
+        f"if ({V_LEN}({V_DATA})/2)~={V_EXPECT_LEN} then error('Protected payload length check failed') end",
         f"local {V_OUT}={{}}",
-        f"local {V_SUM_A}=0x45D9",
-        f"local {V_SUM_B}=0xA7C3",
-        f"local {V_CSUM_A}=0x6D31",
-        f"local {V_CSUM_B}=0x91E7",
-        f"local {V_EXPECT_A}={checksum_a}",
-        f"local {V_EXPECT_B}={checksum_b}",
-        f"local {V_CEXPECT_A}={cipher_a}",
-        f"local {V_CEXPECT_B}={cipher_b}",
-
-        # Verify the stored ciphertext independently before decoding.
+        f"local {V_I}=1",
+        f"local {V_J}=1",
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"if {V_VALUE}==nil then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Encoded payload contains an invalid byte.') end",
-        f"{V_ERROR}('Protected payload encoding check failed')",
+        f"if {V_VALUE}==nil then error('Protected payload encoding invalid') end",
+        f"{V_OUT}[{V_J}]={V_VALUE}; {V_J}={V_J}+1",
         "end",
-        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
-        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+((({V_I}+1)/2)*29))%4294967296",
+        f"local {V_I}=1",
+        f"local {V_J}=1",
+        f"local {V_VALUE}=0",
+        f"local {V_PREV}=0",
+        # Ciphertext digest A/B/C + rolling tag.
+        f"local {V_CA}={V_CA}; local {V_CB}={V_CB}; local {V_CC}={V_CC}; local {V_CR}=0xA5C3",
+        f"for {V_I}=1,{V_EXPECT_LEN} do",
+        f"local {V_X}={V_OUT}[{V_I}]",
+        f"{V_CA}=({V_CA}*251+{V_X}+{V_I}*3)%65536",
+        f"{V_CB}=({V_CB}*277+{V_X}*7+{V_I}*13)%65536",
+        f"{V_CC}=({V_CC}*283+{V_X}*11+{V_I}*19)%65536",
+        f"{V_CR}=({V_CR}*109+{V_X}*31+{V_I}*23)%4294967296",
         "end",
-
-        f"if {V_CSUM_A}~={V_CEXPECT_A} or {V_CSUM_B}~={V_CEXPECT_B} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper check failed: encrypted payload was modified.') end",
-        f"{V_ERROR}('Protected payload integrity check failed')",
+        f"{V_CR}=({V_CR}+({V_EXPECT_LEN}*0x45D9))%4294967296",
+        f"if {V_CA}~={cipher_a} or {V_CB}~={cipher_b} or {V_CC}~={cipher_c} or {V_CR}~={rolling} then error('Protected ciphertext integrity check failed') end",
+        f"local {V_KEY}={key_lua}",
+        f"local {V_SALT}={salt_lua}",
+        # Reverse rounds.
+        f"for {V_J}={round_count},1,-1 do",
+        f"local {V_KEY}=({V_KEY}[{V_J}])",
+        f"local {V_SALT}=({V_SALT}[{V_J}])",
+        f"local {V_PREV}={V_XOR}({V_XOR}({V_KEY},{V_SALT}),({V_J}*37)%256)",
+        f"for {V_I}=1,{V_EXPECT_LEN} do",
+        f"local {V_X}={V_OUT}[{V_I}]",
+        f"local {V_ROT}=({V_KEY}+{V_SALT}+({V_I}-1)*5+({V_J}-1)*3)%8",
+        f"local {V_MIX}=({V_KEY}+{V_SALT}+{V_I}*29+{V_PREV}*17+({V_J}-1)*41)%256",
+        f"local {V_VALUE}={V_XOR}({V_X},({V_KEY}*13+{V_SALT}*7+({V_I}-1)*11+({V_J}-1)*19)%256)",
+        f"{V_VALUE}=({V_VALUE}-{V_MIX})%256",
+        # Lua modulo is non-negative for positive divisor in standard Lua/Luau.
+        f"if {V_ROT}~=0 then local {V_A}=2^{V_ROT}; local {V_B}=2^(8-{V_ROT}); {V_VALUE}=({V_FLOOR}({V_VALUE}/{V_A})+({V_VALUE}%{V_A})*{V_B})%256 end",
+        f"{V_OUT}[{V_I}]={V_VALUE}",
+        f"{V_PREV}={V_X}",
         "end",
-
-        # Decode and verify plaintext independently.
-        f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
-        f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"{V_VALUE}=({V_VALUE}-{key}-(((({V_I}-1)/2)*31)%256))%256",
-        f"{V_OUT}[(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
-        f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+(({V_I}+1)/2))%4294967296",
-        f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+((({V_I}+1)/2)*17))%4294967296",
         "end",
-
-        f"if {V_LEN}({V_CONCAT}({V_OUT}))~={V_EXPECT_LEN} or {V_SUM_A}~={V_EXPECT_A} or {V_SUM_B}~={V_EXPECT_B} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Anti-tamper check failed: decoded payload was modified.') end",
-        f"{V_ERROR}('Protected payload integrity check failed')",
+        # Reconstruct source.
+        f"local {V_SRC}={{}}",
+        f"for {V_I}=1,{V_EXPECT_LEN} do {V_SRC}[{V_I}]={V_CHAR}({V_OUT}[{V_I}]) end",
+        f"local {V_SRC}={V_CONCAT}({V_SRC})",
+        # Plaintext integrity.
+        f"local {V_PA}={plain_a}; local {V_PB}={plain_b}; local {V_PC}={plain_c}; local {V_PD}={plain_d}",
+        f"for {V_I}=1,{V_LEN}({V_SRC}) do",
+        f"local {V_VALUE}={V_SRC}:byte({V_I})",
+        f"{V_PA}=({V_PA}*257+{V_VALUE}+{V_I})%65536",
+        f"{V_PB}=({V_PB}*263+{V_VALUE}*3+{V_I}*7)%65536",
+        f"{V_PC}=({V_PC}*269+{V_VALUE}*5+{V_I}*11)%65536",
+        f"{V_PD}=({V_PD}*271+{V_VALUE}*7+{V_I}*17)%65536",
         "end",
-
-        # Compile the decoded source. xpcall is used when available, while
-        # keeping pcall as the portable fallback expected by older runtimes.
-        f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
-        f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
-        f"if not {V_FN} then {V_ERROR}('Internal Error: '..{V_TOSTRING}({V_ERR})) end",
-
+        f"if {V_PA}~={plain_a} or {V_PB}~={plain_b} or {V_PC}~={plain_c} or {V_PD}~={plain_d} then error('Protected plaintext integrity check failed') end",
+        # Execute through protected error boundary. Avoid environment/debug probes
+        # that create false positives on otherwise valid executors.
+        f"local {V_FN},{V_ERR}={V_LOAD}({V_SRC})",
+        f"if not {V_FN} then error('Protected payload compile failed: '..tostring({V_ERR})) end",
         f"if {V_TYPE}({V_XPCALL})=='function' then",
-        f"local {V_OK},{V_RESULT}={V_XPCALL}({V_FN},{V_TOSTRING},...)",
-        f"if not {V_OK} then {V_ERROR}('Protected payload execution failed: '..{V_TOSTRING}({V_RESULT})) end",
-        f"return {V_RESULT}",
+        f"local {V_OK},{V_RUNERR}={V_XPCALL}(function() return {V_FN}(...) end,function(e) return e end)",
+        f"if not {V_OK} then error('Protected payload execution failed: '..tostring({V_RUNERR})) end",
+        "else",
+        f"local {V_OK},{V_RUNERR}={V_PCALL}({V_FN},...)",
+        f"if not {V_OK} then error('Protected payload execution failed: '..tostring({V_RUNERR})) end",
         "end",
-
-        f"local {V_OK},{V_RESULT}={V_PCALL}({V_FN},...)",
-        f"if not {V_OK} then {V_ERROR}('Protected payload execution failed: '..{V_TOSTRING}({V_RESULT})) end",
-        f"return {V_RESULT}",
         "end)(...)",
     ]
 
-    payload = lines[0] + "\n\n" + " ".join(
-        x.strip() for x in lines[2:] if x.strip()
-    )
+    # Keep the same compact single-return-file shape expected by the existing
+    # publish/UI pipeline.
+    payload = lines[0] + "\n\n" + " ".join(x.strip() for x in lines[2:] if x.strip())
 
     if publish:
         _raw_backend_publish(payload)
 
     return payload
+
 
 def _pad_lua_payload_to_minimum(payload):
     """Legacy compatibility helper; compact builds are never artificially padded."""
