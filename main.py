@@ -5694,6 +5694,7 @@ OBF_LEVELS = {
     "medium": {"block1": (23, 49), "block2": (27, 55), "decoys": (64, 96), "fragment": (25, 65)},
     "hard": {"block1": (9, 27), "block2": (11, 31), "decoys": (32, 48), "fragment": (8, 32)},
 }
+_OBF_LEVELS = OBF_LEVELS
 
 def normalize_obf_level(level):
     level = str(level or "hard").strip().lower()
@@ -5871,33 +5872,279 @@ def _junk_opaque_math(used):
         return f"local {v1}=(({_num_expr(b)}*{_num_expr(a)})/{_num_expr(a)})-{_num_expr(b)}+{_make_noise_expression()}"
 
 
+def _junk_pcall_noise(used):
+    """A pcall that always succeeds but result is discarded."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3 = N(), N(), N()
+    style = _RNG.randint(0, 3)
+    if style == 0:
+        a = _RNG.randint(1, 9999)
+        return (
+            f"local {v1},{v2}=pcall(function() return {_num_expr(a)} end) "
+            f"local {v3}=({v1} and {v2} or 0)+{_make_noise_expression()}"
+        )
+    elif style == 1:
+        return (
+            f"local {v1},{v2}=pcall(tostring,{_num_expr(_RNG.randint(1,9999))}) "
+            f"local {v3}=({v1} and #{v2} or 0)+{_make_noise_expression()}"
+        )
+    elif style == 2:
+        k = N()
+        return (
+            f"local {v1}=pcall(math.floor,{_num_expr(_RNG.randint(1,9999))}) "
+            f"local {k}={_make_noise_expression()} "
+            f"local {v3}=({v1} and {k} or {k})*{_num_expr(1)}"
+        )
+    else:
+        k1 = N()
+        return (
+            f"local {v1},{k1}=pcall(rawget,_G or {{}},'{N()}') "
+            f"local {v2}={v1} and 1 or 0 "
+            f"local {v3}={v2}+{_make_noise_expression()}"
+        )
+
+
+def _junk_string_ops(used):
+    """Fake string operations whose results are thrown away."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3 = N(), N(), N()
+    chars = string.ascii_letters + string.digits
+    s = "".join(_RNG.choice(chars) for _ in range(_RNG.randint(8, 20)))
+    style = _RNG.randint(0, 3)
+    if style == 0:
+        return (
+            f'local {v1}="{s}" '
+            f"local {v2}=#{v1}+{_make_noise_expression()} "
+            f"local {v3}=string.sub({v1},{_num_expr(1)},{_num_expr(1)})..string.sub({v1},{_num_expr(2)},{_num_expr(2)})"
+        )
+    elif style == 1:
+        return (
+            f'local {v1}=string.rep("{s}",{_num_expr(_RNG.randint(1,3))}) '
+            f"local {v2}=#{v1} "
+            f"local {v3}={v2}+{_make_noise_expression()}"
+        )
+    elif style == 2:
+        k = N()
+        return (
+            f'local {v1}=tostring({_num_expr(_RNG.randint(100,9999))}) '
+            f"local {k}=string.byte({v1},{_num_expr(1)}) "
+            f"local {v2}={k}+{_make_noise_expression()} "
+            f"local {v3}={v2}*{_num_expr(1)}"
+        )
+    else:
+        return (
+            f'local {v1}=string.format("%d",{_num_expr(_RNG.randint(1,9999))}) '
+            f"local {v2}=string.len({v1}) "
+            f"local {v3}={v2}+{_make_noise_expression()}"
+        )
+
+
+def _junk_table_ops(used):
+    """Fake table manipulation — insert/remove/len that does nothing useful."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3 = N(), N(), N()
+    count = _RNG.randint(2, 6)
+    entries = [str(_RNG.randint(1, 9999)) for _ in range(count)]
+    style = _RNG.randint(0, 2)
+    if style == 0:
+        return (
+            f"local {v1}={{{','.join(entries)}}} "
+            f"local {v2}=#{v1} "
+            f"table.insert({v1},{_num_expr(_RNG.randint(1,9999))}) "
+            f"local {v3}=#{v1}+{_make_noise_expression()}"
+        )
+    elif style == 1:
+        return (
+            f"local {v1}={{{','.join(entries)}}} "
+            f"table.remove({v1}) "
+            f"local {v2}=#{v1} "
+            f"local {v3}={v2}+{_make_noise_expression()}"
+        )
+    else:
+        k = N()
+        return (
+            f"local {v1}={{}} "
+            f"for {k}={_num_expr(1)},{_num_expr(count)} do "
+            f"table.insert({v1},{_num_expr(_RNG.randint(1,255))}) "
+            f"end "
+            f"local {v2}=#{v1} "
+            f"local {v3}={v2}+{_make_noise_expression()}"
+        )
+
+
+def _junk_coroutine_probe(used):
+    """Probe coroutine status — runs but result is discarded."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3 = N(), N(), N()
+    style = _RNG.randint(0, 2)
+    if style == 0:
+        return (
+            f"local {v1}=type(coroutine)=='table' and 1 or 0 "
+            f"local {v2}={v1}+{_make_noise_expression()} "
+            f"local {v3}={v2}*{_num_expr(1)}"
+        )
+    elif style == 1:
+        k = N()
+        return (
+            f"local {v1}=coroutine and coroutine.running or nil "
+            f"local {k}=pcall(function() return {v1} and {v1}() or nil end) "
+            f"local {v2}=({k} and 1 or 0)+{_make_noise_expression()} "
+            f"local {v3}={v2}"
+        )
+    else:
+        return (
+            f"local {v1}=type(coroutine.wrap)=='function' and 1 or 0 "
+            f"local {v2}={v1}*{_num_expr(_RNG.randint(1,9999))} "
+            f"local {v3}={v2}+{_make_noise_expression()}"
+        )
+
+
+def _junk_getfenv_deep(used):
+    """Deeper getfenv probing that walks the environment."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3, v4 = N(), N(), N(), N()
+    style = _RNG.randint(0, 3)
+    globals_list = ["game", "_G", "workspace", "script", "shared", "plugin", "os", "math", "table", "string"]
+    g = _RNG.choice(globals_list)
+    if style == 0:
+        return (
+            f"local {v1}=getfenv and getfenv(0) or _ENV or {{}} "
+            f"local {v2}=rawget({v1},'{g}') "
+            f"local {v3}=({v2}~=nil and 1 or 0)+{_make_noise_expression()} "
+            f"local {v4}={v3}*{_num_expr(1)}"
+        )
+    elif style == 1:
+        return (
+            f"local {v1}=getfenv and type(getfenv)=='function' and 1 or 0 "
+            f"local {v2}=setfenv and type(setfenv)=='function' and 1 or 0 "
+            f"local {v3}=({v1}+{v2})+{_make_noise_expression()} "
+            f"local {v4}={v3}*{_num_expr(1)}"
+        )
+    elif style == 2:
+        k = N()
+        return (
+            f"local {v1}=getfenv "
+            f"local {v2}=type({v1}) "
+            f"local {k}=({v2}=='function' and {v1}(1) or {{}}) "
+            f"local {v3}=next({k}) "
+            f"local {v4}=({v3}~=nil and 1 or 0)+{_make_noise_expression()}"
+        )
+    else:
+        lvl = _RNG.randint(0, 5)
+        return (
+            f"local {v1}=pcall(getfenv or function() end,{_num_expr(lvl)}) "
+            f"local {v2}={v1} and 1 or 0 "
+            f"local {v3}={v2}+{_make_noise_expression()} "
+            f"local {v4}={v3}*{_num_expr(1)}"
+        )
+
+
+def _junk_rawget_probe(used):
+    """Rawget/rawset/rawequal checks that return unused results."""
+    N = lambda: _unique_name(used)
+    v1, v2, v3 = N(), N(), N()
+    keys = ["print", "type", "tostring", "tonumber", "error", "warn", "pcall", "select", "ipairs", "pairs"]
+    k = _RNG.choice(keys)
+    style = _RNG.randint(0, 2)
+    if style == 0:
+        return (
+            f"local {v1}=rawget(_G or {{}},'{k}') "
+            f"local {v2}=({v1}~=nil and 1 or 0)+{_make_noise_expression()} "
+            f"local {v3}={v2}*{_num_expr(1)}"
+        )
+    elif style == 1:
+        k2, tbl = N(), N()
+        return (
+            f"local {tbl}={{['{k}']={_num_expr(_RNG.randint(1,9999))}}} "
+            f"local {v1}=rawget({tbl},'{k}') "
+            f"local {k2}=rawequal({v1},{v1}) "
+            f"local {v3}=({k2} and 1 or 0)+{_make_noise_expression()}"
+        )
+    else:
+        tbl = N()
+        return (
+            f"local {tbl}={{}} "
+            f"rawset({tbl},'{k}',{_num_expr(_RNG.randint(1,9999))}) "
+            f"local {v1}=rawget({tbl},'{k}') "
+            f"local {v2}=({v1}~=nil and 1 or 0)+{_make_noise_expression()} "
+            f"local {v3}={v2}"
+        )
+
+
+def _junk_select_probe(used):
+    """select('#', ...) or select(n, ...) that is discarded."""
+    N = lambda: _unique_name(used)
+    v1, v2 = N(), N()
+    n = _RNG.randint(1, 5)
+    vals = [str(_RNG.randint(1, 9999)) for _ in range(_RNG.randint(3, 6))]
+    style = _RNG.randint(0, 1)
+    if style == 0:
+        return (
+            f"local {v1}=select('#',{','.join(vals)}) "
+            f"local {v2}={v1}+{_make_noise_expression()}"
+        )
+    else:
+        return (
+            f"local {v1}=select({_num_expr(n)},{','.join(vals)}) "
+            f"local {v2}=({v1} or 0)+{_make_noise_expression()}"
+        )
+
+
 def _build_junk_block(used, count):
     """Return `count` junk statements joined by spaces."""
     generators = [
         _junk_getfenv_block,
+        _junk_getfenv_deep,
         _junk_dead_branch,
         _junk_fake_string_table,
         _junk_fake_checksum,
         _junk_env_probe,
         _junk_opaque_math,
+        _junk_pcall_noise,
+        _junk_string_ops,
+        _junk_table_ops,
+        _junk_coroutine_probe,
+        _junk_rawget_probe,
+        _junk_select_probe,
     ]
+    # Weight getfenv/env probes heavier so they appear more often
+    weighted = (
+        [_junk_getfenv_block] * 3
+        + [_junk_getfenv_deep] * 3
+        + [_junk_env_probe] * 2
+        + [_junk_rawget_probe] * 2
+        + generators
+    )
     parts = []
     for _ in range(count):
-        fn = _RNG.choice(generators)
+        fn = _RNG.choice(weighted)
         parts.append(fn(used))
     return " ".join(parts)
 
 
 def _compute_junk_count(source_line_count: int) -> int:
     """
-    Scale junk statement count so payload size ≈ source_line_count KB.
-    Each junk statement is ~100-200 bytes; targeting ~1000 bytes per line:
-      lines * 1000 bytes ÷ ~150 bytes/junk ≈ lines * 6.67 junk statements.
-    We clamp to reasonable bounds so tiny scripts still get decent coverage.
+    Scale junk statement count so payload size ≈ source_line_count * 1 KB.
+    Target sizes:
+      ~500 lines  → ~500 KB
+      ~1000 lines → ~1 MB
+      ~2000 lines → ~2 MB
+      ~3000 lines → ~3 MB
+
+    Each junk statement averages ~200 bytes (mix of short math, long checksums,
+    getfenv probes, dead branches, string tables).
+    lines * 1000 bytes ÷ 200 bytes/junk = lines * 5 junk statements.
+    We add a 1.4x headroom factor since fragment encoding also expands size 8x.
+    Actually the fragment table dominates — junk is threaded BETWEEN fragments.
+    Targeting ~70 junk statements per 100 source lines gives the right scale.
     """
-    target_bytes = source_line_count * 1000          # ~1 KB per source line
-    bytes_per_junk = 150                              # conservative estimate
-    count = max(30, min(int(target_bytes / bytes_per_junk), 60000))
+    # Each source line → ~1 KB of junk (before binary token expansion adds 8x to the cipher payload)
+    # Junk is emitted as plain Lua, not encrypted, so it directly adds bytes.
+    # Average junk statement ≈ 180 bytes.
+    # We want: source_line_count * 1000 bytes of junk
+    # => count = source_line_count * 1000 / 180 ≈ source_line_count * 5.6
+    # Clamp: at least 40 (small scripts), at most 80000 (avoid absurd compile times)
+    count = max(40, min(int(source_line_count * 5.6), 80000))
     return count
 
 
