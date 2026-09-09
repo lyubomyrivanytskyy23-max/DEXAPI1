@@ -100,8 +100,12 @@ async def record_execution(
         + (f" reason={reason}" if reason else "")
     )
 
+    # Track daily stats for live chart
+    asyncio.create_task(_record_exec_stat(success))
+
     # Fire webhook asynchronously — do not await, so the loader is never slowed
     asyncio.create_task(_fire_exec_webhooks(entry))
+    asyncio.create_task(_fire_custom_exec_webhooks(entry))
 
 
 async def _fire_exec_webhooks(entry: Dict[str, Any]) -> None:
@@ -128,6 +132,52 @@ async def _fire_exec_webhooks(entry: Dict[str, Any]) -> None:
             log.warning(f"[WEBHOOK] exec delivery failed → {url}: {exc}")
 
 
+async def _fire_custom_exec_webhooks(entry: Dict[str, Any]) -> None:
+    """Send a Discord-formatted embed to every enabled custom webhook."""
+    if not toggle("webhooks_enabled"):
+        return
+    async with _custom_webhooks_lock:
+        hooks = [h for h in _custom_webhooks if h.get("enabled", True)]
+    if not hooks:
+        return
+
+    ok_icon  = "✅" if entry.get("success") else "❌"
+    color    = 0x4ade80 if entry.get("success") else 0xf87171
+    desc     = (
+        f"**Slug:** `{entry.get('slug','?')}`\n"
+        f"**IP:** `{entry.get('ip','?')}`\n"
+        f"**Reason:** `{entry.get('reason') or 'ok'}`\n"
+        f"**Time:** `{entry.get('ts_str','?')}`"
+        + (f"\n**HWID:** `{entry['hwid']}`" if entry.get('hwid') else "")
+        + (f"\n**Key:** `{entry['key_hint']}`" if entry.get('key_hint') else "")
+    )
+    discord_payload = json.dumps({
+        "username": WEBHOOK_USERNAME,
+        "avatar_url": WEBHOOK_AVATAR_URL,
+        "embeds": [{
+            "title": f"{ok_icon} Script Execution — {entry.get('slug','?')}",
+            "description": desc,
+            "color": color,
+            "footer": {"text": "DexNotifier Execution Log"},
+            "timestamp": entry.get("ts_str", ""),
+        }],
+    }, ensure_ascii=False).encode("utf-8")
+
+    for hook in hooks:
+        url = hook.get("url", "").strip()
+        if not url:
+            continue
+        try:
+            req = urllib.request.Request(
+                url, data=discord_payload, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                log.debug(f"[CUSTOM_WEBHOOK] exec → {url} status={resp.status}")
+        except Exception as exc:
+            log.warning(f"[CUSTOM_WEBHOOK] exec delivery failed → {url}: {exc}")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # WEBHOOK CONFIG — set via env vars. All are optional; unset = disabled.
 #
@@ -149,6 +199,94 @@ WEBHOOK_REGISTER_URL    = os.environ.get("DEX_WEBHOOK_REGISTER",   "").strip()
 WEBHOOK_LOGIN_URL       = os.environ.get("DEX_WEBHOOK_LOGIN",      "").strip()
 WEBHOOK_CHAT_URL        = os.environ.get("DEX_WEBHOOK_CHAT",       "").strip()
 WEBHOOK_BLACKLIST_URL   = os.environ.get("DEX_WEBHOOK_BLACKLIST",  "").strip()
+
+# ─── FIXED AVATAR for all custom webhook Discord embeds ───────────────────────
+WEBHOOK_AVATAR_URL = "https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536"
+WEBHOOK_USERNAME   = "DexNotifier"
+
+# ─── CUSTOM USER-ADDED WEBHOOKS (persisted to disk) ───────────────────────────
+# Each entry: {"id": str, "url": str, "label": str, "enabled": bool, "added_at": float}
+_custom_webhooks: List[Dict[str, Any]] = []
+_custom_webhooks_lock = asyncio.Lock()
+_CUSTOM_WEBHOOKS_FILE: str = ""   # filled in by _init_custom_webhooks()
+
+def _init_custom_webhooks(data_dir: str) -> None:
+    global _CUSTOM_WEBHOOKS_FILE
+    _CUSTOM_WEBHOOKS_FILE = os.path.join(data_dir, "custom_webhooks.json")
+    _load_custom_webhooks_from_disk()
+
+def _load_custom_webhooks_from_disk() -> None:
+    global _custom_webhooks
+    if not _CUSTOM_WEBHOOKS_FILE or not os.path.exists(_CUSTOM_WEBHOOKS_FILE):
+        return
+    try:
+        with open(_CUSTOM_WEBHOOKS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            _custom_webhooks = data
+    except Exception as exc:
+        log.warning(f"[CUSTOM_WEBHOOKS] Could not load: {exc}")
+
+def _save_custom_webhooks_to_disk() -> None:
+    if not _CUSTOM_WEBHOOKS_FILE:
+        return
+    try:
+        tmp = _CUSTOM_WEBHOOKS_FILE + ".tmp." + secrets.token_hex(4)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_custom_webhooks, f, ensure_ascii=False)
+        os.replace(tmp, _CUSTOM_WEBHOOKS_FILE)
+    except Exception as exc:
+        log.warning(f"[CUSTOM_WEBHOOKS] Could not save: {exc}")
+
+# ─── EXECUTION STATS for live chart (daily buckets, last 30 days) ─────────────
+# Stored as {"YYYY-MM-DD": {"total": int, "success": int, "fail": int}}
+_exec_daily_stats: Dict[str, Dict[str, int]] = {}
+_exec_stats_lock = asyncio.Lock()
+_EXEC_STATS_FILE: str = ""
+
+def _init_exec_stats(data_dir: str) -> None:
+    global _EXEC_STATS_FILE
+    _EXEC_STATS_FILE = os.path.join(data_dir, "exec_daily_stats.json")
+    _load_exec_stats_from_disk()
+
+def _load_exec_stats_from_disk() -> None:
+    global _exec_daily_stats
+    if not _EXEC_STATS_FILE or not os.path.exists(_EXEC_STATS_FILE):
+        return
+    try:
+        with open(_EXEC_STATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _exec_daily_stats = data
+    except Exception as exc:
+        log.warning(f"[EXEC_STATS] Could not load: {exc}")
+
+def _save_exec_stats_to_disk() -> None:
+    if not _EXEC_STATS_FILE:
+        return
+    try:
+        tmp = _EXEC_STATS_FILE + ".tmp." + secrets.token_hex(4)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_exec_daily_stats, f, ensure_ascii=False)
+        os.replace(tmp, _EXEC_STATS_FILE)
+    except Exception as exc:
+        log.warning(f"[EXEC_STATS] Could not save: {exc}")
+
+async def _record_exec_stat(success: bool) -> None:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    async with _exec_stats_lock:
+        if day not in _exec_daily_stats:
+            _exec_daily_stats[day] = {"total": 0, "success": 0, "fail": 0}
+        _exec_daily_stats[day]["total"] += 1
+        if success:
+            _exec_daily_stats[day]["success"] += 1
+        else:
+            _exec_daily_stats[day]["fail"] += 1
+        # Keep only last 35 days
+        if len(_exec_daily_stats) > 35:
+            oldest = sorted(_exec_daily_stats.keys())[0]
+            del _exec_daily_stats[oldest]
+        _save_exec_stats_to_disk()
 
 
 def _configured_webhooks() -> Dict[str, str]:
@@ -1402,7 +1540,9 @@ def _resolve_data_dir() -> str:
 
 
 DATA_DIR = _resolve_data_dir()
-_init_toggles(DATA_DIR)  # load persisted feature toggles from disk
+_init_toggles(DATA_DIR)          # load persisted feature toggles from disk
+_init_custom_webhooks(DATA_DIR)   # load persisted custom webhook URLs
+_init_exec_stats(DATA_DIR)        # load persisted daily execution stats
 _USING_FALLBACK_DATA_DIR = DATA_DIR != (os.environ.get("DEX_DATA_DIR", "/data").strip() or "/data")
 if _USING_FALLBACK_DATA_DIR:
     print(f"[DATA_DIR] *** WARNING: running WITHOUT persistent storage. Using ephemeral "
@@ -5275,6 +5415,7 @@ async def build_admin_dashboard_body() -> str:
             <li><button data-tab="users"><span class="dn-nav-icon">&#9786;</span>Users &amp; Keys</button></li>
             <li><button data-tab="obf"><span class="dn-nav-icon">&#9670;</span>Obfustucate</button></li>
             <li><button data-tab="toggles"><span class="dn-nav-icon">&#9881;</span>Toggles &amp; Logs</button></li>
+            <li><button data-tab="webhooks"><span class="dn-nav-icon">&#9901;</span>Webhooks</button></li>
             <li><button class="danger-tab" data-tab="danger"><span class="dn-nav-icon">&#9888;</span>Danger Zone</button></li>
         </ul>
         <div class="dn-sidebar-foot">Signed in with the Railway admin session.<br><a href="/admin/logout">Log out &rarr;</a></div>
@@ -5455,6 +5596,142 @@ async def build_admin_dashboard_body() -> str:
     </section>
     """
 
+    tab_webhooks = f"""
+    <section class="tab-panel" id="tab-webhooks">
+        <div class="card accent-teal">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+                <div>
+                    <h2 style="margin:0;">Custom Webhooks</h2>
+                    <p class="small-text" style="margin:6px 0 0;">
+                        Add as many Discord webhook URLs as you want. When a script is served, a Lua logging
+                        snippet is injected into the code that fires all enabled webhooks. The avatar is always
+                        the DexNotifier icon. If the script has obfuscation toggled on, the injected payload
+                        is also obfuscated.
+                    </p>
+                </div>
+                <span class="pill green" id="webhook-count-pill">0 webhooks</span>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+                <input id="wh-url-input" type="text" placeholder="https://discord.com/api/webhooks/..." style="flex:1;min-width:260px;" maxlength="2048">
+                <input id="wh-label-input" type="text" placeholder="Label (optional)" style="width:180px;" maxlength="80">
+                <button type="button" id="wh-add-btn">Add Webhook</button>
+            </div>
+            <div id="wh-add-status" class="small-text" style="margin-bottom:10px;min-height:14px;"></div>
+
+            <div id="wh-list" style="display:flex;flex-direction:column;gap:8px;">
+                <div class="small-text" style="color:#555;text-align:center;padding:18px 0;">Loading webhooks…</div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+            <h2>Env-Var Webhooks (read-only)</h2>
+            <p class="small-text">These are set via DEX_WEBHOOK_* environment variables and are always active when the master switch is on.</p>
+            <div id="wh-env-box" class="logs-box" style="font-size:12px;font-family:monospace;">Loading…</div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+            <h2>Webhook Avatar Preview</h2>
+            <p class="small-text">All webhooks always use this fixed avatar. It cannot be changed.</p>
+            <div style="display:flex;align-items:center;gap:16px;margin-top:10px;">
+                <img src="{WEBHOOK_AVATAR_URL}" alt="Webhook Avatar"
+                     style="width:64px;height:64px;border-radius:50%;border:2px solid #2a2a2a;object-fit:cover;"
+                     onerror="this.style.display='none'">
+                <div>
+                    <div style="color:#fff;font-weight:700;font-size:14px;">{WEBHOOK_USERNAME}</div>
+                    <code style="font-size:11px;color:#4ade80;word-break:break-all;">{WEBHOOK_AVATAR_URL}</code>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        (()=>{{
+            const addStatus = document.getElementById('wh-add-status');
+            function whStatus(msg, ok) {{
+                addStatus.textContent = msg;
+                addStatus.style.color = ok ? '#4ade80' : '#f87171';
+                setTimeout(()=>{{ if(addStatus.textContent===msg) addStatus.textContent=''; }}, 3500);
+            }}
+
+            async function loadWebhooks() {{
+                const list = document.getElementById('wh-list');
+                const pill = document.getElementById('webhook-count-pill');
+                try {{
+                    const r = await fetch('/admin/webhooks/custom', {{credentials:'same-origin', cache:'no-store'}});
+                    const d = await r.json();
+                    if (!r.ok) {{ list.innerHTML='<div class="small-text" style="color:#f87171;">Error loading webhooks.</div>'; return; }}
+                    const hooks = d.webhooks || [];
+                    pill.textContent = hooks.length + ' webhook' + (hooks.length===1?'':'s');
+                    if (!hooks.length) {{
+                        list.innerHTML = '<div class="small-text" style="color:#555;text-align:center;padding:18px 0;">No custom webhooks yet. Add one above.</div>';
+                        return;
+                    }}
+                    list.innerHTML = hooks.map(h => `
+                        <div class="card" style="padding:14px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;" data-wh-id="${{h.id}}">
+                            <img src="{WEBHOOK_AVATAR_URL}" style="width:36px;height:36px;border-radius:50%;border:1px solid #2a2a2a;flex:0 0 36px;" onerror="this.style.display='none'">
+                            <div style="flex:1;min-width:0;">
+                                <div style="font-weight:700;color:#fff;font-size:13px;">${{h.label||'(unlabeled)'}}</div>
+                                <div style="font-size:11px;color:#555;word-break:break-all;margin-top:2px;">${{h.url.slice(0,60)}}${{h.url.length>60?'…':''}}</div>
+                            </div>
+                            <span class="pill ${{h.enabled?'green':''}}" style="cursor:pointer;" title="Click to toggle" onclick="toggleWH('${{h.id}}',${{!h.enabled}})">${{h.enabled?'Enabled':'Disabled'}}</span>
+                            <button type="button" onclick="testWH('${{h.id}}')" style="font-size:11px;padding:5px 10px;" title="Send test embed">Test</button>
+                            <button type="button" class="danger-btn" onclick="deleteWH('${{h.id}}')" style="font-size:11px;padding:5px 10px;">Delete</button>
+                        </div>
+                    `).join('');
+                }} catch(e) {{ list.innerHTML='<div class="small-text" style="color:#f87171;">Network error.</div>'; }}
+            }}
+
+            window.toggleWH = async function(id, enabled) {{
+                const r = await fetch('/admin/webhooks/custom/'+id, {{method:'PATCH',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{enabled}}),credentials:'same-origin'}});
+                if (r.ok) loadWebhooks(); else whStatus('Toggle failed', false);
+            }};
+            window.testWH = async function(id) {{
+                whStatus('Sending test…', true);
+                const r = await fetch('/admin/webhooks/test-single', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id}}),credentials:'same-origin'}});
+                const d = await r.json().catch(()=>({{}}));
+                whStatus(r.ok ? ('Test sent ✓ (HTTP '+d.status+')') : (d.error||'Send failed'), r.ok);
+            }};
+            window.deleteWH = async function(id) {{
+                if (!confirm('Delete this webhook?')) return;
+                const r = await fetch('/admin/webhooks/custom/'+id, {{method:'DELETE',credentials:'same-origin'}});
+                if (r.ok) loadWebhooks(); else whStatus('Delete failed', false);
+            }};
+
+            document.getElementById('wh-add-btn').addEventListener('click', async ()=>{{
+                const url   = document.getElementById('wh-url-input').value.trim();
+                const label = document.getElementById('wh-label-input').value.trim();
+                if (!url) {{ whStatus('URL required', false); return; }}
+                whStatus('Adding…', true);
+                const r = await fetch('/admin/webhooks/custom', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{url,label}}),credentials:'same-origin'}});
+                const d = await r.json().catch(()=>({{}}));
+                if (!r.ok) {{ whStatus(d.error||'Failed to add', false); return; }}
+                document.getElementById('wh-url-input').value='';
+                document.getElementById('wh-label-input').value='';
+                whStatus('Webhook added ✓', true);
+                loadWebhooks();
+            }});
+
+            // Env-var webhook status
+            async function loadEnvWebhooks() {{
+                const box = document.getElementById('wh-env-box');
+                try {{
+                    const r = await fetch('/admin/webhooks', {{credentials:'same-origin', cache:'no-store'}});
+                    const d = await r.json();
+                    const master = d.master_enabled ? '<span style="color:#4ade80">ENABLED</span>' : '<span style="color:#f87171">DISABLED (master switch off)</span>';
+                    const lines = Object.entries(d.urls||{{}}).map(([k,v])=>
+                        `${{k.padEnd(12,' ')}}: ${{v ? '<span style="color:#4ade80">'+v+'</span>' : '<span style="color:#333">not set</span>'}}`
+                    ).join('\\n');
+                    box.innerHTML = `<div style="margin-bottom:6px;">Master: ${{master}}</div><pre style="margin:0;">${{lines}}</pre>`;
+                }} catch {{ box.textContent = 'Error loading.'; }}
+            }}
+
+            loadWebhooks();
+            loadEnvWebhooks();
+        }})();
+        </script>
+    </section>
+    """
+
     tab_danger = """
     <section class="tab-panel" id="tab-danger">
         <div class="card accent-danger">
@@ -5554,8 +5831,24 @@ async def build_admin_dashboard_body() -> str:
 
         <div class="card" style="margin-top:16px;">
             <h2>Webhook Status</h2>
-            <p class="small-text">Configured webhook endpoints. Set via environment variables (DEX_WEBHOOK_*).</p>
+            <p class="small-text">Env-var webhooks (DEX_WEBHOOK_*). To add custom webhook URLs, use the <strong>Webhooks</strong> tab in the sidebar.</p>
             <div id="webhook-status-box" class="logs-box" style="font-size:12px;font-family:monospace;">Loading…</div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+            <h2>Execution Chart <span class="pill" id="exec-chart-period-label" style="font-size:11px;margin-left:8px;">7 days</span></h2>
+            <p class="small-text">Daily execution totals. Switch between 7-day, 30-day views.</p>
+            <div style="display:flex;gap:8px;margin:10px 0 14px;">
+                <button type="button" class="ghost-btn" id="chart-7d-btn" style="font-size:11px;padding:5px 11px;">7 Days</button>
+                <button type="button" class="ghost-btn" id="chart-30d-btn" style="font-size:11px;padding:5px 11px;">30 Days</button>
+                <button type="button" id="exec-chart-refresh-btn" style="font-size:11px;padding:5px 11px;">&#8635; Refresh</button>
+            </div>
+            <canvas id="exec-chart-canvas" width="900" height="240" style="width:100%;height:240px;border-radius:8px;background:#0d0d0d;display:block;"></canvas>
+            <div id="exec-chart-totals" class="small-text" style="margin-top:10px;display:flex;gap:18px;flex-wrap:wrap;">
+                <span>Total: <strong id="exec-chart-total">—</strong></span>
+                <span style="color:#4ade80;">Success: <strong id="exec-chart-success">—</strong></span>
+                <span style="color:#f87171;">Fail: <strong id="exec-chart-fail">—</strong></span>
+            </div>
         </div>
 
         <script>
@@ -5654,6 +5947,84 @@ async def build_admin_dashboard_body() -> str:
 
             loadExecLog();
             loadWebhookStatus();
+
+            // ── Execution Chart ───────────────────────────────────────────
+            let _chartDays = 7;
+            const canvas = document.getElementById('exec-chart-canvas');
+            const ctx = canvas ? canvas.getContext('2d') : null;
+
+            async function loadExecChart(days) {{
+                _chartDays = days;
+                document.getElementById('exec-chart-period-label').textContent = days + ' days';
+                if (!ctx) return;
+                try {{
+                    const r = await fetch('/admin/exec-stats?days=' + days, {{credentials:'same-origin', cache:'no-store'}});
+                    const d = await r.json();
+                    if (!r.ok) return;
+                    const items = d.days || [];
+                    const labels = items.map(i => i.date.slice(5));
+                    const totals  = items.map(i => i.total);
+                    const success = items.map(i => i.success);
+                    const fails   = items.map(i => i.fail);
+                    // totals
+                    const T = totals.reduce((a,b)=>a+b,0);
+                    const S = success.reduce((a,b)=>a+b,0);
+                    const F = fails.reduce((a,b)=>a+b,0);
+                    document.getElementById('exec-chart-total').textContent = T;
+                    document.getElementById('exec-chart-success').textContent = S;
+                    document.getElementById('exec-chart-fail').textContent = F;
+                    // draw
+                    const W = canvas.width, H = canvas.height;
+                    const pad = {{l:44,r:14,t:18,b:38}};
+                    const maxV = Math.max(...totals, 1);
+                    ctx.clearRect(0, 0, W, H);
+                    ctx.fillStyle = '#0d0d0d';
+                    ctx.fillRect(0,0,W,H);
+                    const n = labels.length;
+                    const barW = (W - pad.l - pad.r) / n;
+                    // grid
+                    ctx.strokeStyle = '#1e1e1e'; ctx.lineWidth = 1;
+                    const gridSteps = 4;
+                    for (let g=0;g<=gridSteps;g++) {{
+                        const y = pad.t + (H-pad.t-pad.b)*(1-g/gridSteps);
+                        ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
+                        ctx.fillStyle='#555'; ctx.font='10px monospace'; ctx.textAlign='right';
+                        ctx.fillText(Math.round(maxV*g/gridSteps), pad.l-4, y+4);
+                    }}
+                    // bars
+                    for (let i=0;i<n;i++) {{
+                        const x = pad.l + i*barW;
+                        const bH_t = totals[i]/maxV*(H-pad.t-pad.b);
+                        const bH_s = success[i]/maxV*(H-pad.t-pad.b);
+                        const bH_f = fails[i]/maxV*(H-pad.t-pad.b);
+                        // total (bg)
+                        ctx.fillStyle='rgba(99,102,241,0.18)';
+                        ctx.fillRect(x+2, H-pad.b-bH_t, barW-4, bH_t);
+                        // success
+                        ctx.fillStyle='rgba(74,222,128,0.7)';
+                        ctx.fillRect(x+2, H-pad.b-bH_s, barW-4, bH_s);
+                        // fail
+                        ctx.fillStyle='rgba(248,113,113,0.7)';
+                        ctx.fillRect(x+2, H-pad.b-bH_f, (barW-4)*0.45, bH_f);
+                        // label
+                        ctx.fillStyle='#444'; ctx.font='9px monospace'; ctx.textAlign='center';
+                        ctx.fillText(labels[i], x+barW/2, H-pad.b+14);
+                    }}
+                    // legend
+                    ctx.fillStyle='rgba(74,222,128,0.7)'; ctx.fillRect(pad.l,4,10,8);
+                    ctx.fillStyle='#888'; ctx.font='10px sans-serif'; ctx.textAlign='left';
+                    ctx.fillText('Success',pad.l+14,11);
+                    ctx.fillStyle='rgba(248,113,113,0.7)'; ctx.fillRect(pad.l+70,4,10,8);
+                    ctx.fillText('Fail',pad.l+84,11);
+                    ctx.fillStyle='rgba(99,102,241,0.5)'; ctx.fillRect(pad.l+110,4,10,8);
+                    ctx.fillText('Total',pad.l+124,11);
+                }} catch(e) {{ console.warn('Chart error',e); }}
+            }}
+
+            document.getElementById('chart-7d-btn').addEventListener('click', ()=>loadExecChart(7));
+            document.getElementById('chart-30d-btn').addEventListener('click', ()=>loadExecChart(30));
+            document.getElementById('exec-chart-refresh-btn').addEventListener('click', ()=>loadExecChart(_chartDays));
+            loadExecChart(7);
         }})();
         </script>
     </section>
@@ -5670,6 +6041,7 @@ async def build_admin_dashboard_body() -> str:
         + tab_users
         + tab_obf
         + tab_toggles
+        + tab_webhooks
         + tab_danger
         + "</main>"
     )
@@ -6162,12 +6534,201 @@ async def admin_webhook_test(request: Request):
     if not require_admin_session(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     configured = _configured_webhooks()
-    if not configured:
-        return JSONResponse({"ok": False, "error": "no webhooks configured"})
+    fired = list(configured.keys())
     payload = {"event": "test", "message": "DexNotifier webhook test", "timestamp": time.time()}
     for name, url in configured.items():
         fire_webhook_bg(url, {**payload, "webhook": name})
-    return JSONResponse({"ok": True, "fired": list(configured.keys())})
+    # Also fire custom webhooks test
+    async with _custom_webhooks_lock:
+        hooks = [h for h in _custom_webhooks if h.get("enabled", True)]
+    if hooks:
+        discord_payload = json.dumps({
+            "username": WEBHOOK_USERNAME,
+            "avatar_url": WEBHOOK_AVATAR_URL,
+            "embeds": [{
+                "title": "🔔 DexNotifier — Webhook Test",
+                "description": "This is a test message from your DexNotifier webhook integration.",
+                "color": 0x6366f1,
+                "footer": {"text": "DexNotifier Webhook System"},
+            }],
+        }, ensure_ascii=False).encode("utf-8")
+        for hook in hooks:
+            url = hook.get("url", "").strip()
+            if not url:
+                continue
+            fired.append(hook.get("label") or url[:40])
+            try:
+                req = urllib.request.Request(
+                    url, data=discord_payload, method="POST",
+                    headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    log.debug(f"[CUSTOM_WEBHOOK] test → {url} status={resp.status}")
+            except Exception as exc:
+                log.warning(f"[CUSTOM_WEBHOOK] test failed → {url}: {exc}")
+    if not configured and not hooks:
+        return JSONResponse({"ok": False, "error": "no webhooks configured"})
+    return JSONResponse({"ok": True, "fired": fired})
+
+
+@app.post("/admin/webhooks/test-single")
+async def admin_webhook_test_single(request: Request):
+    """Fire a test Discord embed to a single custom webhook by id."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "expected JSON"}, status_code=400)
+    hook_id = str(body.get("id") or "").strip()
+    if not hook_id:
+        return JSONResponse({"error": "id required"}, status_code=400)
+    async with _custom_webhooks_lock:
+        hook = next((h for h in _custom_webhooks if h.get("id") == hook_id), None)
+    if not hook:
+        return JSONResponse({"error": "webhook not found"}, status_code=404)
+    url = hook.get("url", "").strip()
+    if not url:
+        return JSONResponse({"error": "webhook has no URL"}, status_code=400)
+    discord_payload = json.dumps({
+        "username": WEBHOOK_USERNAME,
+        "avatar_url": WEBHOOK_AVATAR_URL,
+        "embeds": [{
+            "title": "🔔 DexNotifier — Webhook Test",
+            "description": f"Test from webhook **{html.escape(hook.get('label') or 'custom')}**.\nThis is working correctly.",
+            "color": 0x4ade80,
+            "footer": {"text": "DexNotifier Webhook System"},
+        }],
+    }, ensure_ascii=False).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=discord_payload, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)[:200]})
+    return JSONResponse({"ok": True, "status": status})
+
+
+# ── Custom webhook CRUD ────────────────────────────────────────────────────────
+
+WEBHOOK_URL_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-_/?=&%#@+:]{10,2048}$")
+MAX_CUSTOM_WEBHOOKS = 50
+
+
+@app.get("/admin/webhooks/custom")
+async def admin_get_custom_webhooks(request: Request):
+    """Return all custom webhooks (urls redacted to first 40 chars for safety)."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    async with _custom_webhooks_lock:
+        hooks = list(_custom_webhooks)
+    return JSONResponse({"ok": True, "webhooks": hooks})
+
+
+@app.post("/admin/webhooks/custom")
+async def admin_add_custom_webhook(request: Request):
+    """Add a new custom webhook URL."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "expected JSON"}, status_code=400)
+    url   = str(body.get("url") or "").strip()
+    label = str(body.get("label") or "").strip()[:80]
+    if not url:
+        return JSONResponse({"error": "url required"}, status_code=400)
+    if not WEBHOOK_URL_PATTERN.match(url):
+        return JSONResponse({"error": "invalid webhook URL"}, status_code=400)
+    async with _custom_webhooks_lock:
+        if len(_custom_webhooks) >= MAX_CUSTOM_WEBHOOKS:
+            return JSONResponse({"error": f"maximum {MAX_CUSTOM_WEBHOOKS} webhooks"}, status_code=400)
+        # Prevent exact duplicates
+        if any(h.get("url") == url for h in _custom_webhooks):
+            return JSONResponse({"error": "that URL is already registered"}, status_code=409)
+        hook = {
+            "id":       secrets.token_urlsafe(12),
+            "url":      url,
+            "label":    label or url[:40],
+            "enabled":  True,
+            "added_at": time.time(),
+        }
+        _custom_webhooks.append(hook)
+        _save_custom_webhooks_to_disk()
+    log.info(f"[CUSTOM_WEBHOOK] added id={hook['id']} label={hook['label']}")
+    return JSONResponse({"ok": True, "webhook": hook})
+
+
+@app.patch("/admin/webhooks/custom/{hook_id}")
+async def admin_update_custom_webhook(hook_id: str, request: Request):
+    """Enable/disable or relabel a custom webhook."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "expected JSON"}, status_code=400)
+    async with _custom_webhooks_lock:
+        hook = next((h for h in _custom_webhooks if h.get("id") == hook_id), None)
+        if not hook:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if "enabled" in body:
+            hook["enabled"] = bool(body["enabled"])
+        if "label" in body:
+            hook["label"] = str(body["label"])[:80]
+        _save_custom_webhooks_to_disk()
+    return JSONResponse({"ok": True, "webhook": hook})
+
+
+@app.delete("/admin/webhooks/custom/{hook_id}")
+async def admin_delete_custom_webhook(hook_id: str, request: Request):
+    """Remove a custom webhook."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    async with _custom_webhooks_lock:
+        before = len(_custom_webhooks)
+        _custom_webhooks[:] = [h for h in _custom_webhooks if h.get("id") != hook_id]
+        removed = before - len(_custom_webhooks)
+        if removed:
+            _save_custom_webhooks_to_disk()
+    if not removed:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    log.info(f"[CUSTOM_WEBHOOK] deleted id={hook_id}")
+    return JSONResponse({"ok": True, "removed": removed})
+
+
+# ── Execution stats endpoint for live chart ────────────────────────────────────
+
+@app.get("/admin/exec-stats")
+async def admin_exec_stats(request: Request):
+    """Return daily execution counts for the past N days (default 30)."""
+    ip = _client_ip(request)
+    if rate_limited(ip, "admin_exec_stats", 30, 10.0):
+        return JSONResponse({"error": "rate limited"}, status_code=429)
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        days_back = max(7, min(90, int(request.query_params.get("days", "30"))))
+    except ValueError:
+        days_back = 30
+    today = time.time()
+    result = []
+    for d in range(days_back - 1, -1, -1):
+        day_ts = today - d * 86400
+        day_str = time.strftime("%Y-%m-%d", time.gmtime(day_ts))
+        async with _exec_stats_lock:
+            bucket = _exec_daily_stats.get(day_str, {"total": 0, "success": 0, "fail": 0})
+        result.append({"date": day_str, **bucket})
+    async with _exec_log_lock:
+        total_log = len(_exec_log)
+    return JSONResponse({
+        "ok": True,
+        "days": result,
+        "total_in_log": total_log,
+    }, headers={"Cache-Control": "no-store"})
 
 
 # -----------------------------
@@ -8083,6 +8644,63 @@ SLUG_LOADER_RATE_LIMIT = 30
 SLUG_LOADER_RATE_WINDOW = 10.0
 
 
+def _build_webhook_lua_snippet(hooks: List[Dict[str, Any]], slug: str, ip: str) -> str:
+    """
+    Build a Lua snippet that fires a Discord webhook POST for each enabled
+    custom webhook when the script is executed inside Roblox.
+    If no custom webhooks are enabled, returns an empty string.
+    """
+    enabled_urls = [h["url"] for h in hooks if h.get("enabled", True) and h.get("url")]
+    if not enabled_urls:
+        return ""
+    avatar_url = WEBHOOK_AVATAR_URL
+    lines = [
+        "-- [DexNotifier Webhook Logger]",
+        "do",
+        "  local _dn_ok, _dn_http = pcall(function() return game:GetService('HttpService') end)",
+        "  if _dn_ok and _dn_http then",
+        "    local _dn_ts = tostring(os.time and os.time() or 0)",
+        f"    local _dn_slug = {json.dumps(slug)}",
+        f"    local _dn_ip = {json.dumps(ip)}",
+        f"    local _dn_av = {json.dumps(avatar_url)}",
+        "    local _dn_embed = '{\"username\":\"DexNotifier\",\"avatar_url\":\"'..(_dn_av)..'\",'",
+        "      .. '\"embeds\":[{\"title\":\"\\u25b6 Script Executed\",\"description\":'",
+        "      .. '\"**Slug:** `'.._dn_slug..'`\\\\n**Time:** `'.._dn_ts..'`\",\"color\":5046016}]}'",
+    ]
+    for url in enabled_urls:
+        lines.append(f"    pcall(function()")
+        lines.append(f"      _dn_http:RequestAsync({{")
+        lines.append(f"        Url={json.dumps(url)},")
+        lines.append(f"        Method='POST',")
+        lines.append(f"        Headers={{['Content-Type']='application/json'}},")
+        lines.append(f"        Body=_dn_embed")
+        lines.append(f"      }})")
+        lines.append(f"    end)")
+    lines += ["  end", "end", "-- [End DexNotifier Webhook Logger]", ""]
+    return "\n".join(lines)
+
+
+async def _get_final_code(code: str, slug: str, ip: str, obfuscate_flag: bool) -> str:
+    """
+    If custom webhooks are enabled, prepend a Lua webhook-logging snippet
+    to the code. If obfuscate_flag is set, also obfuscate the full result.
+    """
+    if not toggle("webhooks_enabled"):
+        return code
+    async with _custom_webhooks_lock:
+        hooks = [h for h in _custom_webhooks if h.get("enabled", True)]
+    if not hooks:
+        return code
+    snippet = _build_webhook_lua_snippet(hooks, slug, ip)
+    combined = snippet + code
+    if obfuscate_flag:
+        try:
+            combined = await asyncio.to_thread(obfuscate_lua, combined, False, "hard")
+        except Exception as exc:
+            log.warning(f"[LOADER] webhook-inject obfuscation failed for {slug}: {exc}")
+    return combined
+
+
 @app.get("/{slug}")
 async def dynamic_loader(slug: str, request: Request):
     ip = _client_ip(request)
@@ -8125,6 +8743,7 @@ async def dynamic_loader(slug: str, request: Request):
         script_enabled   = s.get("script_enabled", True)
         log_executions   = s.get("log_executions", False)
         actual_slug      = s.get("slug", slug)
+        obfuscate_flag   = s.get("obfuscate", False)
 
     # ── Per-script enabled toggle ─────────────────────────────────────────
     if not script_enabled:
@@ -8137,7 +8756,8 @@ async def dynamic_loader(slug: str, request: Request):
         if log_executions and toggle("execution_logging"):
             await record_execution(actual_slug, ip, True, "free")
         log.info(f"[LOADER] served slug={actual_slug} ip={ip} type=free")
-        return PlainTextResponse(code)
+        final_code = await _get_final_code(code, actual_slug, ip, obfuscate_flag)
+        return PlainTextResponse(final_code)
 
     # ── Paid-key validation ───────────────────────────────────────────────
     if await is_rate_limited("slug_key_guess", ip):
@@ -8207,7 +8827,8 @@ async def dynamic_loader(slug: str, request: Request):
     if log_executions and toggle("execution_logging"):
         await record_execution(actual_slug, ip, True, "paid", hwid=hwid, key=key)
     log.info(f"[LOADER] served slug={actual_slug} ip={ip} type=paid")
-    return PlainTextResponse(code)
+    final_code = await _get_final_code(code, actual_slug, ip, obfuscate_flag)
+    return PlainTextResponse(final_code)
 
 
 # -----------------------------
