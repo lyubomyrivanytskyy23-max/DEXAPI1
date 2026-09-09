@@ -6146,7 +6146,7 @@ OBF_PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Obfustucate — DexNotifier</title>
+<title>Dexfuscator — DexNotifier</title>
 <link rel="icon" type="image/webp" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -6212,6 +6212,7 @@ textarea.code::placeholder{color:#333}
       <a href="/">Home</a>
       <a href="/scripts">Scripts</a>
       <a href="/obfuscate" class="active">Obfustucate</a>
+      <a href="/docs">Docs</a>
       <a href="/chat">Chat</a>
       <a href="/home">Dashboard</a>
     </nav>
@@ -6364,10 +6365,6 @@ _MINIFIED_HEADER='-- This file was protected using Dex Obfustucator v4.5 [.gg/de
 def _format_minified_lua(source: str) -> str:
     body=_minify_lua_preserve_strings(source)
     return _MINIFIED_HEADER+'\\n\\n'+body
-
-@app.get("/obfuscate")
-async def obfuscate_page():
-    return HTMLResponse(OBF_PAGE)
 
 def _dex_obfuscator_default_settings() -> dict:
     """Return the public DEX Obfuscator V8 settings used by the website."""
@@ -6529,6 +6526,226 @@ def _strip_goofyscator_header(protected: str) -> str:
 @app.get("/obfuscate")
 async def obfuscate_page():
     return HTMLResponse(OBF_PAGE)
+
+
+DOCS_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dexfuscator API</title>
+<link rel="icon" type="image/webp" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{min-height:100%;background:#0d0d0d;color:#ccc;font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.6}
+.topbar{display:flex;align-items:center;justify-content:space-between;height:44px;padding:0 20px;background:#161616;border-bottom:1px solid #222;position:sticky;top:0;z-index:100}
+.topbar-left{display:flex;align-items:center;gap:16px}
+.topbar-brand{color:#fff;font-weight:700;font-size:14px;text-decoration:none}
+.topbar-nav{display:flex;gap:2px}
+.topbar-nav a{padding:6px 10px;border-radius:6px;color:#888;text-decoration:none;font-size:13px;transition:color .15s,background .15s}
+.topbar-nav a:hover{color:#fff;background:#1e1e1e}
+.topbar-nav a.active{color:#fff;background:#1e1e1e}
+.page{max-width:860px;margin:0 auto;padding:48px 24px 80px}
+h1{font-size:26px;font-weight:800;color:#fff;letter-spacing:-.03em;margin-bottom:6px}
+.subtitle{color:#666;font-size:14px;margin-bottom:40px}
+h2{font-size:15px;font-weight:700;color:#4ade80;letter-spacing:.04em;text-transform:uppercase;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+h2 .method-badge{background:#4ade8022;border:1px solid #4ade8044;color:#4ade80;border-radius:5px;padding:2px 9px;font-size:11px;letter-spacing:.06em;font-weight:800;text-transform:uppercase}
+h2 .method-badge.blue{background:#38bdf822;border-color:#38bdf844;color:#38bdf8}
+.section{margin-bottom:40px}
+p.desc{color:#888;font-size:13px;margin-bottom:14px}
+.code-block{background:#111;border:1px solid #222;border-radius:8px;padding:18px 20px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.75;color:#c9d1d9;overflow-x:auto;position:relative}
+.code-block .key{color:#79c0ff}
+.code-block .str{color:#a5d6ff}
+.code-block .num{color:#f2cc60}
+.code-block .bool{color:#ff7b72}
+.code-block .comment{color:#555}
+.copy-btn{position:absolute;top:10px;right:10px;background:#1e1e1e;border:1px solid #333;color:#888;border-radius:5px;padding:4px 10px;font-size:11px;font-family:Inter,system-ui,sans-serif;cursor:pointer;transition:.15s}
+.copy-btn:hover{color:#fff;border-color:#555}
+.table-wrap{background:#111;border:1px solid #222;border-radius:8px;overflow:hidden;margin-top:4px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 16px;font-size:11px;font-weight:700;letter-spacing:.06em;color:#555;text-transform:uppercase;border-bottom:1px solid #1e1e1e;background:#141414}
+td{padding:11px 16px;font-size:13px;border-bottom:1px solid #1a1a1a;vertical-align:top}
+tr:last-child td{border-bottom:none}
+td:first-child{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#79c0ff}
+td:nth-child(2){color:#888;font-size:12px}
+td:nth-child(3){color:#aaa}
+.resp-ok{display:inline-flex;align-items:center;gap:5px;color:#4ade80;font-size:12px;font-weight:700;background:#4ade8012;border:1px solid #4ade8030;border-radius:5px;padding:2px 9px}
+.resp-ok::before{content:'';width:6px;height:6px;border-radius:50%;background:#4ade80}
+.resp-err{display:inline-flex;align-items:center;gap:5px;color:#f87171;font-size:12px;font-weight:700;background:#f8717112;border:1px solid #f8717130;border-radius:5px;padding:2px 9px}
+.resp-err::before{content:'';width:6px;height:6px;border-radius:50%;background:#f87171}
+.divider{height:1px;background:#1a1a1a;margin:36px 0}
+footer{color:#444;font-size:12px;text-align:center;padding:24px 0}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="topbar-left">
+    <a class="topbar-brand" href="/">DexNotifier</a>
+    <nav class="topbar-nav">
+      <a href="/">Home</a>
+      <a href="/scripts">Scripts</a>
+      <a href="/obfuscate">Obfustucate</a>
+      <a href="/docs" class="active">Docs</a>
+      <a href="/chat">Chat</a>
+      <a href="/home">Dashboard</a>
+    </nav>
+  </div>
+</div>
+
+<div class="page">
+  <h1>Dexfuscator API</h1>
+  <p class="subtitle">HTTP API reference for the Dexfuscator obfuscation service.</p>
+
+  <!-- POST /obfuscate -->
+  <div class="section">
+    <h2><span class="method-badge">POST</span> /obfuscate</h2>
+    <p class="desc">Send Lua or Luau source code. The API obfuscates it and returns the protected script.</p>
+    <div class="code-block" id="req-block">
+<button class="copy-btn" onclick="copyBlock('req-block', this)">Copy</button><span class="comment">// Request body (JSON)</span>
+{
+  <span class="key">"source"</span>: <span class="str">"print('hello')"</span>
+}</div>
+  </div>
+
+  <!-- Success response -->
+  <div class="section">
+    <h2><span class="method-badge blue">200</span> Successful response</h2>
+    <p class="desc">On success the API returns HTTP <strong style="color:#fff">200</strong> and the obfuscated script inside <code style="color:#79c0ff;background:#111;padding:1px 6px;border-radius:4px;font-size:12px">result</code>.</p>
+    <div class="code-block" id="res-ok-block">
+<button class="copy-btn" onclick="copyBlock('res-ok-block', this)">Copy</button>{
+  <span class="key">"status"</span>: <span class="str">"success"</span>,
+  <span class="key">"result"</span>: <span class="str">"-- obfuscated code here"</span>
+}</div>
+  </div>
+
+  <!-- Error response -->
+  <div class="section">
+    <h2><span class="method-badge" style="background:#f8717122;border-color:#f8717144;color:#f87171">4xx / 5xx</span> Error response</h2>
+    <p class="desc">When something goes wrong the status code reflects the failure (400 bad input, 413 too large, 429 rate limited, 502 upstream failure, etc.) and the body contains an <code style="color:#79c0ff;background:#111;padding:1px 6px;border-radius:4px;font-size:12px">error</code> string.</p>
+    <div class="code-block" id="res-err-block">
+<button class="copy-btn" onclick="copyBlock('res-err-block', this)">Copy</button>{
+  <span class="key">"error"</span>: <span class="str">"Lua source is empty."</span>
+}</div>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Fields table -->
+  <div class="section">
+    <h2>Request fields</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>source</td><td>string&nbsp;(required)</td><td>Valid Lua / Luau source code to protect.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Response fields</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>status</td><td>string</td><td><code style="color:#4ade80">"success"</code> on success.</td></tr>
+          <tr><td>result</td><td>string</td><td>The obfuscated Lua source code.</td></tr>
+          <tr><td>payload</td><td>string</td><td>Loadstring URL — paste directly into a Roblox script.</td></tr>
+          <tr><td>error</td><td>string</td><td>Present only on failure. Human-readable reason.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Example: cURL -->
+  <div class="section">
+    <h2>Example — cURL</h2>
+    <div class="code-block" id="curl-block">
+<button class="copy-btn" onclick="copyBlock('curl-block', this)">Copy</button><span class="comment"># Plain text in the JSON body — no settings needed</span>
+curl -X POST https://dexapi1.up.railway.app/obfuscate \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"source":"print(\"hello\")"}'</span></div>
+  </div>
+
+  <!-- Example: Python -->
+  <div class="section">
+    <h2>Example — Python</h2>
+    <div class="code-block" id="py-block">
+<button class="copy-btn" onclick="copyBlock('py-block', this)">Copy</button>import requests
+
+resp = requests.post(
+    <span class="str">"https://dexapi1.up.railway.app/obfuscate"</span>,
+    json={<span class="str">"source"</span>: <span class="str">"print('hello')"</span>},
+)
+
+data = resp.json()
+if resp.status_code == <span class="num">200</span>:
+    print(data[<span class="str">"result"</span>])   <span class="comment"># obfuscated Lua</span>
+else:
+    print(<span class="str">"Error:"</span>, data.get(<span class="str">"error"</span>))</div>
+  </div>
+
+  <!-- Example: JavaScript -->
+  <div class="section">
+    <h2>Example — JavaScript</h2>
+    <div class="code-block" id="js-block">
+<button class="copy-btn" onclick="copyBlock('js-block', this)">Copy</button>const resp = await fetch(<span class="str">"https://dexapi1.up.railway.app/obfuscate"</span>, {
+  method: <span class="str">"POST"</span>,
+  headers: { <span class="str">"Content-Type"</span>: <span class="str">"application/json"</span> },
+  body: JSON.stringify({ source: <span class="str">"print('hello')"</span> }),
+});
+
+const data = await resp.json();
+if (resp.ok) {
+  console.log(data.result);   <span class="comment">// obfuscated Lua</span>
+} else {
+  console.error(data.error);
+}</div>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Rate limits -->
+  <div class="section">
+    <h2>Rate limits &amp; limits</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Limit</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Max source size</td><td>16 MB</td></tr>
+          <tr><td>Rate limit</td><td>Per-IP, enforced server-side — back off and retry on <code style="color:#f87171">429</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <footer>Dexfuscator API &mdash; DexNotifier &mdash; <a href="/obfuscate" style="color:#555">Try it in the UI →</a></footer>
+</div>
+
+<script>
+function copyBlock(id, btn) {
+  const el = document.getElementById(id);
+  const text = el.innerText.replace(/^Copy\n?/, '').trim();
+  navigator.clipboard.writeText(text).then(() => {
+    const old = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = old, 1400);
+  }).catch(() => {
+    btn.textContent = 'Failed';
+    setTimeout(() => btn.textContent = 'Copy', 1400);
+  });
+}
+</script>
+</body>
+</html>"""
+
+
+@app.get("/docs")
+async def docs_page():
+    return HTMLResponse(DOCS_PAGE)
 
 
 @app.post("/obfuscate")
