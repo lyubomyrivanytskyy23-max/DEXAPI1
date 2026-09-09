@@ -78,6 +78,7 @@ async def record_execution(
     reason: str = "",
     hwid: str = "",
     key: str = "",
+    exec_webhook_url: str = "",
 ) -> None:
     """Record one script execution event. Called from dynamic_loader."""
     entry: Dict[str, Any] = {
@@ -106,6 +107,10 @@ async def record_execution(
     # Fire webhook asynchronously — do not await, so the loader is never slowed
     asyncio.create_task(_fire_exec_webhooks(entry))
     asyncio.create_task(_fire_custom_exec_webhooks(entry))
+
+    # Per-script Discord webhook (set by script owner on the /home panel)
+    if exec_webhook_url:
+        asyncio.create_task(_fire_per_script_exec_webhook(entry, exec_webhook_url))
 
 
 async def _fire_exec_webhooks(entry: Dict[str, Any]) -> None:
@@ -176,6 +181,42 @@ async def _fire_custom_exec_webhooks(entry: Dict[str, Any]) -> None:
                 log.debug(f"[CUSTOM_WEBHOOK] exec → {url} status={resp.status}")
         except Exception as exc:
             log.warning(f"[CUSTOM_WEBHOOK] exec delivery failed → {url}: {exc}")
+
+
+async def _fire_per_script_exec_webhook(entry: Dict[str, Any], url: str) -> None:
+    """Send a Discord embed to the per-script owner webhook URL set on /home."""
+    if not url:
+        return
+    ok_icon = "✅" if entry.get("success") else "❌"
+    color   = 0x4ade80 if entry.get("success") else 0xf87171
+    desc = (
+        f"**Slug:** `{entry.get('slug','?')}`\n"
+        f"**IP:** `{entry.get('ip','?')}`\n"
+        f"**Reason:** `{entry.get('reason') or 'ok'}`\n"
+        f"**Time:** `{entry.get('ts_str','?')}`"
+        + (f"\n**HWID:** `{entry['hwid']}`" if entry.get('hwid') else "")
+        + (f"\n**Key:** `{entry['key_hint']}`" if entry.get('key_hint') else "")
+    )
+    discord_payload = json.dumps({
+        "username": WEBHOOK_USERNAME,
+        "avatar_url": WEBHOOK_AVATAR_URL,
+        "embeds": [{
+            "title": f"{ok_icon} Execution — {entry.get('slug','?')}",
+            "description": desc,
+            "color": color,
+            "footer": {"text": "DexNotifier Script Execution"},
+            "timestamp": entry.get("ts_str", ""),
+        }],
+    }, ensure_ascii=False).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=discord_payload, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            log.debug(f"[PER_SCRIPT_WEBHOOK] exec → {url} status={resp.status}")
+    except Exception as exc:
+        log.warning(f"[PER_SCRIPT_WEBHOOK] delivery failed → {url}: {exc}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3945,11 +3986,28 @@ def build_home_logged_in_body(username: str, message: str = "", success: str = "
         script_enabled     = s.get("script_enabled", True)
         rate_limit_enabled = s.get("rate_limit_enabled", False)
         log_executions     = s.get("log_executions", False)
+        exec_webhook_url_val = s.get("exec_webhook_url", "")
         last_key = s.get("last_key", "")
         last_loadstring = s.get("last_loadstring", "")
         paid_text = "Paid" if is_paid else "Free"
         hwid_text = "HWID Locked" if hwid_lock else "No HWID"
         endpoint = f"{BASE_URL}/{slug}"
+        # Discord webhook field shown only when Log Execs is on
+        exec_webhook_field_edit = ""
+        if log_executions:
+            exec_webhook_field_edit = f"""
+                <label class="label" style="margin-top:12px;">
+                    Discord Webhook URL for Execution Logs
+                    <span style="font-size:10px;color:#788;font-weight:400;"> (optional — Discord webhook only)</span>
+                </label>
+                <input type="url" name="exec_webhook_url"
+                    placeholder="https://discord.com/api/webhooks/..."
+                    value="{html.escape(exec_webhook_url_val)}"
+                    style="font-size:12px;font-family:ui-monospace,monospace;"
+                    maxlength="512">
+                <p class="small-text" style="font-size:11px;margin-top:4px;color:#666;">
+                    Each execution will send a Discord embed to this webhook. Leave blank to disable per-script webhook.
+                </p>"""
         cards_html += f"""
         <div class="card">
             <h2>{html.escape(name)} ({html.escape(slug)})</h2>
@@ -3960,6 +4018,7 @@ def build_home_logged_in_body(username: str, message: str = "", success: str = "
                 {'<span class="pill green">Enabled</span>' if script_enabled else '<span class="pill red">Disabled</span>'}
                 {'<span class="pill red">Rate Limit</span>' if rate_limit_enabled else ''}
                 {'<span class="pill" style="color:#f59e0b;border-color:#3a2000;background:#1a0e00">Log Execs</span>' if log_executions else ''}
+                {'<span class="pill" style="color:#a78bfa;border-color:#2a1a4a;background:#100918">Webhook Set</span>' if (log_executions and exec_webhook_url_val) else ''}
             </p>
             <p class="small-text">Endpoint: <code>{html.escape(endpoint)}</code></p>
             <p class="small-text">Executor loadstring:</p>
@@ -3995,7 +4054,6 @@ loadstring(game:HttpGet("{html.escape(endpoint)}"))()
                         <span class="tog-track"></span>
                         <span class="tog-label">HWID Lock</span>
                     </label>
-
                     <label class="tog">
                         <input type="checkbox" name="script_enabled" {'checked' if s.get('script_enabled', True) else ''}>
                         <span class="tog-track"></span>
@@ -4007,11 +4065,19 @@ loadstring(game:HttpGet("{html.escape(endpoint)}"))()
                         <span class="tog-label">Rate Limit</span>
                     </label>
                     <label class="tog danger">
-                        <input type="checkbox" name="log_executions" {'checked' if s.get('log_executions') else ''}>
+                        <input type="checkbox" name="log_executions" id="log_exec_{html.escape(slug)}" {'checked' if s.get('log_executions') else ''} onchange="toggleWebhookField_{html.escape(slug).replace('-','_')}(this.checked)">
                         <span class="tog-track"></span>
                         <span class="tog-label">Log Execs</span>
                     </label>
                 </div>
+                <div id="webhook_section_{html.escape(slug).replace('-','_')}" style="{'display:block' if log_executions else 'display:none'}">
+                    {exec_webhook_field_edit}
+                </div>
+                <script>
+                function toggleWebhookField_{html.escape(slug).replace('-','_')}(on) {{
+                    document.getElementById('webhook_section_{html.escape(slug).replace('-','_')}').style.display = on ? 'block' : 'none';
+                }}
+                </script>
                 <button type="submit" style="margin-top:14px;">Save Changes</button>
             </form>
             <p class="small-text" style="margin-top:10px;">Generate paid key for this script:</p>
@@ -4121,18 +4187,36 @@ loadstring(game:HttpGet("{html.escape(endpoint)}"))()
                     <span class="tog-label">Rate Limit</span>
                 </label>
                 <label class="tog danger">
-                    <input type="checkbox" name="log_executions">
+                    <input type="checkbox" name="log_executions" id="create_log_executions" onchange="toggleCreateWebhookField(this.checked)">
                     <span class="tog-track"></span>
                     <span class="tog-label">Log Execs</span>
                 </label>
             </div>
-            <p class="small-text" style="margin-top:6px;font-size:11px;">
+            <div id="create_webhook_section" style="display:none;margin-top:12px;">
+                <label class="label">
+                    Discord Webhook URL for Execution Logs
+                    <span style="font-size:10px;color:#788;font-weight:400;"> (optional — Discord webhook only)</span>
+                </label>
+                <input type="url" name="exec_webhook_url"
+                    placeholder="https://discord.com/api/webhooks/..."
+                    style="font-size:12px;font-family:ui-monospace,monospace;"
+                    maxlength="512">
+                <p class="small-text" style="font-size:11px;margin-top:4px;color:#666;">
+                    Each execution of this script will post a Discord embed to this webhook. Must be a valid Discord webhook URL.
+                </p>
+            </div>
+            <script>
+            function toggleCreateWebhookField(on) {{
+                document.getElementById('create_webhook_section').style.display = on ? 'block' : 'none';
+            }}
+            </script>
+            <p class="small-text" style="margin-top:10px;font-size:11px;">
                 <b style="color:#22d3ee">Obfuscate</b>: auto-protect code on save &nbsp;|&nbsp;
                 <b style="color:#f59e0b">Paid</b>: require a key &nbsp;|&nbsp;
                 <b style="color:#a78bfa">HWID Lock</b>: bind to hardware &nbsp;|&nbsp;
                 <b style="color:#4ade80">Enabled</b>: script active &nbsp;|&nbsp;
                 <b style="color:#f87171">Rate Limit</b>: throttle requests &nbsp;|&nbsp;
-                <b style="color:#f87171">Log Execs</b>: track executions
+                <b style="color:#f87171">Log Execs</b>: track executions + optional Discord webhook
             </p>
             <button type="submit" style="margin-top:14px;">Add Script</button>
         </form>
@@ -4346,7 +4430,7 @@ async def discord_login(request: Request):
         )
 
     if get_logged_in_user(request):
-        return RedirectResponse(url="/", status_code=303)
+        return RedirectResponse(url="/home", status_code=303)
 
     state = _make_discord_state()
     params = {
@@ -4426,7 +4510,7 @@ async def discord_callback(request: Request):
 
     username = await _upsert_discord_user(profile)
 
-    resp = RedirectResponse(url="/", status_code=303)
+    resp = RedirectResponse(url="/home", status_code=303)
     resp.delete_cookie("dex_discord_state", path="/")
     set_session_cookie(resp, username)
     return resp
@@ -4514,8 +4598,7 @@ async def home_post(request: Request):
                 "ip":        ip,
                 "timestamp": time.time(),
             })
-        resp = HTMLResponse(HOME_BASE_HTML.format(
-            body=build_home_logged_in_body(username, success="Account created and logged in.")))
+        resp = RedirectResponse(url="/home", status_code=303)
         set_session_cookie(resp, username)
         return resp
 
@@ -4540,8 +4623,7 @@ async def home_post(request: Request):
                 "ip":        ip,
                 "timestamp": time.time(),
             })
-        resp = HTMLResponse(HOME_BASE_HTML.format(
-            body=build_home_logged_in_body(username, success="Logged in.")))
+        resp = RedirectResponse(url="/home", status_code=303)
         set_session_cookie(resp, username)
         return resp
 
@@ -4565,6 +4647,11 @@ async def home_post(request: Request):
         script_enabled    = "script_enabled"    in data
         rate_limit_enabled= "rate_limit_enabled"in data
         log_executions    = "log_executions"    in data
+        # Discord webhook URL for execution logging (only used when log_executions is on)
+        exec_webhook_url  = data.get("exec_webhook_url", [""])[0].strip()[:512]
+        # Validate URL shape if provided
+        if exec_webhook_url and not re.match(r"^https://discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$", exec_webhook_url):
+            exec_webhook_url = ""
 
         if not name or not code:
             return HTMLResponse(HOME_BASE_HTML.format(
@@ -4587,8 +4674,18 @@ async def home_post(request: Request):
 
         async with scripts_lock:
             if any(k.lower() == slug.lower() for k in scripts.keys()):
+                # Suggest an available alternative by appending a suffix
+                suggestion = slug
+                _sfx = 2
+                while any(k.lower() == suggestion.lower() for k in scripts.keys()):
+                    suggestion = f"{slug}-{_sfx}"
+                    _sfx += 1
+                taken_msg = (
+                    f"Endpoint /{slug} is already taken. "
+                    f"You can use /{suggestion} instead."
+                )
                 return HTMLResponse(HOME_BASE_HTML.format(
-                    body=build_home_logged_in_body(current_user, message="Endpoint already exists.")))
+                    body=build_home_logged_in_body(current_user, message=taken_msg)))
             scripts[slug] = {
                 "name": name,
                 "slug": slug,
@@ -4599,6 +4696,7 @@ async def home_post(request: Request):
                 "script_enabled":     script_enabled,
                 "rate_limit_enabled": rate_limit_enabled,
                 "log_executions":     log_executions,
+                "exec_webhook_url":   exec_webhook_url if log_executions else "",
                 "owner": current_user,
                 "created_at": time.time(),
                 "updated_at": time.time(),
@@ -4621,6 +4719,10 @@ async def home_post(request: Request):
         script_enabled     = "script_enabled"     in data
         rate_limit_enabled = "rate_limit_enabled" in data
         log_executions     = "log_executions"     in data
+        # Discord webhook URL for execution logging
+        exec_webhook_url_upd = data.get("exec_webhook_url", [""])[0].strip()[:512]
+        if exec_webhook_url_upd and not re.match(r"^https://discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$", exec_webhook_url_upd):
+            exec_webhook_url_upd = ""
 
         async with scripts_lock:
             s = scripts.get(slug)
@@ -4649,6 +4751,7 @@ async def home_post(request: Request):
             s["script_enabled"]     = script_enabled
             s["rate_limit_enabled"] = rate_limit_enabled
             s["log_executions"]     = log_executions
+            s["exec_webhook_url"]   = exec_webhook_url_upd if log_executions else ""
             s["updated_at"]         = time.time()
             save_scripts_to_file()
         return HTMLResponse(HOME_BASE_HTML.format(
@@ -5598,61 +5701,154 @@ async def build_admin_dashboard_body() -> str:
 
     tab_webhooks = f"""
     <section class="tab-panel" id="tab-webhooks">
-        <div class="card accent-teal">
+
+        <!-- ── Avatar / Brand Card ───────────────────────────────────────── -->
+        <div class="card" style="margin-bottom:16px;">
+            <h2 style="margin-bottom:10px;">Webhook Identity</h2>
+            <p class="small-text" style="margin-bottom:14px;">
+                All custom webhooks use this fixed avatar and username. It cannot be changed per-webhook.
+                This is also the favicon shown in new browser tabs when sharing links from this panel.
+            </p>
+            <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                <div style="position:relative;">
+                    <img src="{WEBHOOK_AVATAR_URL}" alt="Webhook Avatar"
+                         style="width:72px;height:72px;border-radius:50%;border:2px solid #4ade80;object-fit:cover;display:block;"
+                         onerror="this.style.opacity='0.2'">
+                    <div style="position:absolute;bottom:-4px;right:-4px;width:18px;height:18px;border-radius:50%;background:#4ade80;border:2px solid #111;"></div>
+                </div>
+                <div style="flex:1;min-width:200px;">
+                    <div style="color:#fff;font-weight:800;font-size:16px;margin-bottom:4px;">{WEBHOOK_USERNAME}</div>
+                    <div style="font-size:11px;color:#555;margin-bottom:8px;">Discord Bot Username</div>
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                        <code style="font-size:10px;color:#4ade80;background:#0a1a0a;border:1px solid #1a3a1a;padding:4px 8px;border-radius:5px;word-break:break-all;">{WEBHOOK_AVATAR_URL}</code>
+                        <button type="button" onclick="(()=>{{navigator.clipboard?navigator.clipboard.writeText('{WEBHOOK_AVATAR_URL}'):((a=document.createElement('textarea'),a.value='{WEBHOOK_AVATAR_URL}',document.body.appendChild(a),a.select(),document.execCommand('copy'),document.body.removeChild(a)));this.textContent='Copied!';setTimeout(()=>this.textContent='Copy URL',1200)}})()" style="font-size:11px;padding:4px 10px;flex-shrink:0;">Copy URL</button>
+                        <a href="{WEBHOOK_AVATAR_URL}" target="_blank" rel="noopener" style="font-size:11px;padding:4px 10px;background:#1e1e1e;border:1px solid #2a2a2a;border-radius:7px;color:#ccc;text-decoration:none;">Open in Tab ↗</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── Add Webhook Card ──────────────────────────────────────────── -->
+        <div class="card accent-teal" style="margin-bottom:16px;">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
                 <div>
                     <h2 style="margin:0;">Custom Webhooks</h2>
                     <p class="small-text" style="margin:6px 0 0;">
-                        Add as many Discord webhook URLs as you want. When a script is served, a Lua logging
-                        snippet is injected into the code that fires all enabled webhooks. The avatar is always
-                        the DexNotifier icon. If the script has obfuscation toggled on, the injected payload
-                        is also obfuscated.
+                        Add unlimited Discord webhook URLs. When a script is served, a Lua logging snippet is
+                        injected into the raw code that fires all enabled webhooks on execution.
+                        If the script has <strong>Obfuscate</strong> toggled on, the injected webhook payload
+                        is also obfuscated. Avatar is always the DexNotifier icon above.
                     </p>
                 </div>
-                <span class="pill green" id="webhook-count-pill">0 webhooks</span>
+                <span class="pill green" id="webhook-count-pill" style="flex-shrink:0;">0 webhooks</span>
             </div>
 
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
-                <input id="wh-url-input" type="text" placeholder="https://discord.com/api/webhooks/..." style="flex:1;min-width:260px;" maxlength="2048">
-                <input id="wh-label-input" type="text" placeholder="Label (optional)" style="width:180px;" maxlength="80">
-                <button type="button" id="wh-add-btn">Add Webhook</button>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:flex-end;">
+                <div style="flex:1;min-width:260px;">
+                    <div style="font-size:11px;color:#555;margin-bottom:5px;font-weight:700;letter-spacing:.04em;">DISCORD WEBHOOK URL</div>
+                    <input id="wh-url-input" type="url" placeholder="https://discord.com/api/webhooks/ID/TOKEN" style="width:100%;" maxlength="2048" autocomplete="off" spellcheck="false">
+                </div>
+                <div style="width:180px;">
+                    <div style="font-size:11px;color:#555;margin-bottom:5px;font-weight:700;letter-spacing:.04em;">LABEL (OPTIONAL)</div>
+                    <input id="wh-label-input" type="text" placeholder="e.g. My Server Logs" style="width:100%;" maxlength="80">
+                </div>
+                <button type="button" id="wh-test-url-btn" title="Send a test embed to the URL above without saving it" style="padding:9px 14px;">Test URL</button>
+                <button type="button" id="wh-add-btn" style="padding:9px 18px;background:#4ade80;color:#052420;border-color:#4ade80;font-weight:700;">+ Add Webhook</button>
             </div>
-            <div id="wh-add-status" class="small-text" style="margin-bottom:10px;min-height:14px;"></div>
+            <div id="wh-add-status" class="small-text" style="margin-bottom:14px;min-height:16px;"></div>
 
-            <div id="wh-list" style="display:flex;flex-direction:column;gap:8px;">
+            <!-- Test-all button -->
+            <div style="display:flex;gap:8px;align-items:center;padding:10px 14px;background:#0a0d12;border:1px solid #1a2030;border-radius:8px;margin-bottom:14px;">
+                <span style="flex:1;font-size:12px;color:#888;">Fire a test Discord embed to all enabled webhooks at once to verify delivery.</span>
+                <button type="button" id="wh-test-all-btn" style="font-size:12px;padding:6px 14px;flex-shrink:0;">🔔 Test All</button>
+            </div>
+            <div id="wh-test-all-status" class="small-text" style="margin-bottom:10px;min-height:14px;"></div>
+
+            <div id="wh-list" style="display:flex;flex-direction:column;gap:10px;">
                 <div class="small-text" style="color:#555;text-align:center;padding:18px 0;">Loading webhooks…</div>
             </div>
         </div>
 
-        <div class="card" style="margin-top:16px;">
-            <h2>Env-Var Webhooks (read-only)</h2>
-            <p class="small-text">These are set via DEX_WEBHOOK_* environment variables and are always active when the master switch is on.</p>
-            <div id="wh-env-box" class="logs-box" style="font-size:12px;font-family:monospace;">Loading…</div>
-        </div>
-
-        <div class="card" style="margin-top:16px;">
-            <h2>Webhook Avatar Preview</h2>
-            <p class="small-text">All webhooks always use this fixed avatar. It cannot be changed.</p>
-            <div style="display:flex;align-items:center;gap:16px;margin-top:10px;">
-                <img src="{WEBHOOK_AVATAR_URL}" alt="Webhook Avatar"
-                     style="width:64px;height:64px;border-radius:50%;border:2px solid #2a2a2a;object-fit:cover;"
-                     onerror="this.style.display='none'">
+        <!-- ── Live Execution Chart ──────────────────────────────────────── -->
+        <div class="card" style="margin-bottom:16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
                 <div>
-                    <div style="color:#fff;font-weight:700;font-size:14px;">{WEBHOOK_USERNAME}</div>
-                    <code style="font-size:11px;color:#4ade80;word-break:break-all;">{WEBHOOK_AVATAR_URL}</code>
+                    <h2 style="margin:0;">Live Execution Chart
+                        <span class="pill" id="wh-chart-period-label" style="font-size:11px;margin-left:8px;vertical-align:middle;">7 days</span>
+                    </h2>
+                    <p class="small-text" style="margin:5px 0 0;">Script execution events per day — tracks total, success, and failures.</p>
+                </div>
+                <div style="display:flex;gap:7px;flex-wrap:wrap;">
+                    <button type="button" id="wh-chart-7d" style="font-size:11px;padding:5px 11px;">7 Days</button>
+                    <button type="button" id="wh-chart-30d" style="font-size:11px;padding:5px 11px;">30 Days</button>
+                    <button type="button" id="wh-chart-refresh" style="font-size:11px;padding:5px 11px;">&#8635; Refresh</button>
                 </div>
             </div>
+
+            <!-- Stat boxes -->
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+                <div style="background:#0d0f14;border:1px solid #1a2030;border-radius:9px;padding:12px 14px;">
+                    <div style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">Total Executions</div>
+                    <div style="font-size:22px;font-weight:800;color:#fff;" id="wh-stat-total">—</div>
+                </div>
+                <div style="background:#0d0f14;border:1px solid #1a2030;border-radius:9px;padding:12px 14px;">
+                    <div style="font-size:10px;color:#4ade80;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">Success</div>
+                    <div style="font-size:22px;font-weight:800;color:#4ade80;" id="wh-stat-success">—</div>
+                </div>
+                <div style="background:#0d0f14;border:1px solid #1a2030;border-radius:9px;padding:12px 14px;">
+                    <div style="font-size:10px;color:#f87171;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">Failures</div>
+                    <div style="font-size:22px;font-weight:800;color:#f87171;" id="wh-stat-fail">—</div>
+                </div>
+                <div style="background:#0d0f14;border:1px solid #1a2030;border-radius:9px;padding:12px 14px;">
+                    <div style="font-size:10px;color:#a78bfa;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">Success Rate</div>
+                    <div style="font-size:22px;font-weight:800;color:#a78bfa;" id="wh-stat-rate">—</div>
+                </div>
+            </div>
+
+            <canvas id="wh-exec-chart" width="900" height="220"
+                    style="width:100%;height:220px;border-radius:8px;background:#0a0d12;display:block;border:1px solid #1a2030;"></canvas>
+            <div id="wh-chart-status" class="small-text" style="margin-top:8px;min-height:14px;color:#555;text-align:center;"></div>
+        </div>
+
+        <!-- ── Recent Execution Log ──────────────────────────────────────── -->
+        <div class="card" style="margin-bottom:16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+                <div>
+                    <h2 style="margin:0;">Recent Executions</h2>
+                    <p class="small-text" style="margin:4px 0 0;">Last 50 script execution events. Newest first. Auto-refreshes every 10s while this tab is open.</p>
+                </div>
+                <div style="display:flex;gap:7px;">
+                    <input type="text" id="wh-exec-filter" placeholder="Filter by slug…" style="font-size:12px;padding:6px 10px;width:160px;">
+                    <button type="button" id="wh-exec-refresh-btn" style="font-size:11px;padding:5px 11px;">Refresh</button>
+                </div>
+            </div>
+            <div id="wh-exec-log-box" class="logs-box" style="max-height:320px;overflow:auto;font-size:11px;font-family:monospace;">Loading…</div>
+        </div>
+
+        <!-- ── Env-Var Webhooks ──────────────────────────────────────────── -->
+        <div class="card">
+            <h2>Env-Var Webhooks (read-only)</h2>
+            <p class="small-text">These are set via DEX_WEBHOOK_* environment variables and are always active when the master switch is on. They receive raw JSON — not Discord embeds.</p>
+            <div id="wh-env-box" class="logs-box" style="font-size:12px;font-family:monospace;margin-top:12px;">Loading…</div>
         </div>
 
         <script>
         (()=>{{
+            // ── Status helpers ─────────────────────────────────────────────
             const addStatus = document.getElementById('wh-add-status');
             function whStatus(msg, ok) {{
                 addStatus.textContent = msg;
                 addStatus.style.color = ok ? '#4ade80' : '#f87171';
-                setTimeout(()=>{{ if(addStatus.textContent===msg) addStatus.textContent=''; }}, 3500);
+                setTimeout(()=>{{ if(addStatus.textContent===msg) addStatus.textContent=''; }}, 4000);
+            }}
+            const testAllStatus = document.getElementById('wh-test-all-status');
+            function whTestStatus(msg, ok) {{
+                testAllStatus.textContent = msg;
+                testAllStatus.style.color = ok ? '#4ade80' : '#f87171';
+                setTimeout(()=>{{ if(testAllStatus.textContent===msg) testAllStatus.textContent=''; }}, 5000);
             }}
 
+            // ── Load & render webhook list ─────────────────────────────────
             async function loadWebhooks() {{
                 const list = document.getElementById('wh-list');
                 const pill = document.getElementById('webhook-count-pill');
@@ -5663,70 +5859,290 @@ async def build_admin_dashboard_body() -> str:
                     const hooks = d.webhooks || [];
                     pill.textContent = hooks.length + ' webhook' + (hooks.length===1?'':'s');
                     if (!hooks.length) {{
-                        list.innerHTML = '<div class="small-text" style="color:#555;text-align:center;padding:18px 0;">No custom webhooks yet. Add one above.</div>';
+                        list.innerHTML = '<div class="small-text" style="color:#555;text-align:center;padding:24px 0;border:1px dashed #222;border-radius:8px;">No custom webhooks yet. Add your first one above.</div>';
                         return;
                     }}
-                    list.innerHTML = hooks.map(h => `
-                        <div class="card" style="padding:14px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;" data-wh-id="${{h.id}}">
-                            <img src="{WEBHOOK_AVATAR_URL}" style="width:36px;height:36px;border-radius:50%;border:1px solid #2a2a2a;flex:0 0 36px;" onerror="this.style.display='none'">
-                            <div style="flex:1;min-width:0;">
-                                <div style="font-weight:700;color:#fff;font-size:13px;">${{h.label||'(unlabeled)'}}</div>
-                                <div style="font-size:11px;color:#555;word-break:break-all;margin-top:2px;">${{h.url.slice(0,60)}}${{h.url.length>60?'…':''}}</div>
+                    list.innerHTML = hooks.map(h => {{
+                        const addedDate = h.added_at ? new Date(h.added_at*1000).toLocaleString() : '';
+                        const urlShort = h.url.length > 55 ? h.url.slice(0,55)+'…' : h.url;
+                        return `
+                        <div class="card" style="padding:14px 16px;" data-wh-id="${{h.id}}">
+                            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                                <img src="{WEBHOOK_AVATAR_URL}"
+                                     style="width:40px;height:40px;border-radius:50%;border:2px solid ${{h.enabled?'#4ade80':'#2a2a2a'}};flex:0 0 40px;transition:.2s;"
+                                     onerror="this.style.display='none'">
+                                <div style="flex:1;min-width:0;">
+                                    <div style="font-weight:700;color:#fff;font-size:13px;margin-bottom:2px;">
+                                        ${{h.label||'(unlabeled)'}}
+                                        ${{h.enabled ? '<span style=\'font-size:10px;color:#4ade80;margin-left:6px;\'>● ACTIVE</span>' : '<span style=\'font-size:10px;color:#555;margin-left:6px;\'>● PAUSED</span>'}}
+                                    </div>
+                                    <div style="font-size:11px;color:#555;word-break:break-all;font-family:monospace;" title="${{h.url}}">${{urlShort}}</div>
+                                    ${{addedDate ? '<div style="font-size:10px;color:#444;margin-top:3px;">Added ' + addedDate + '</div>' : ''}}
+                                </div>
+                                <div style="display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0;">
+                                    <button type="button"
+                                            style="font-size:11px;padding:5px 11px;background:${{h.enabled?'#0a2a1a':'#1e1e1e'}};color:${{h.enabled?'#4ade80':'#888'}};border-color:${{h.enabled?'#1a4a2a':'#2a2a2a'}};"
+                                            title="Click to ${{h.enabled?'disable':'enable'}}"
+                                            onclick="toggleWH('${{h.id}}',${{!h.enabled}})">${{h.enabled?'✓ Enabled':'○ Disabled'}}</button>
+                                    <button type="button" onclick="testWH('${{h.id}}')"
+                                            style="font-size:11px;padding:5px 11px;" title="Send test Discord embed to this URL">🔔 Test</button>
+                                    <button type="button" class="danger-btn" onclick="deleteWH('${{h.id}}')"
+                                            style="font-size:11px;padding:5px 11px;">🗑 Delete</button>
+                                </div>
                             </div>
-                            <span class="pill ${{h.enabled?'green':''}}" style="cursor:pointer;" title="Click to toggle" onclick="toggleWH('${{h.id}}',${{!h.enabled}})">${{h.enabled?'Enabled':'Disabled'}}</span>
-                            <button type="button" onclick="testWH('${{h.id}}')" style="font-size:11px;padding:5px 10px;" title="Send test embed">Test</button>
-                            <button type="button" class="danger-btn" onclick="deleteWH('${{h.id}}')" style="font-size:11px;padding:5px 10px;">Delete</button>
-                        </div>
-                    `).join('');
-                }} catch(e) {{ list.innerHTML='<div class="small-text" style="color:#f87171;">Network error.</div>'; }}
+                            <div id="wh-test-status-${{h.id}}" class="small-text" style="margin-top:8px;min-height:14px;"></div>
+                        </div>`;
+                    }}).join('');
+                }} catch(e) {{ list.innerHTML='<div class="small-text" style="color:#f87171;">Network error: ' + e.message + '</div>'; }}
             }}
 
             window.toggleWH = async function(id, enabled) {{
                 const r = await fetch('/admin/webhooks/custom/'+id, {{method:'PATCH',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{enabled}}),credentials:'same-origin'}});
                 if (r.ok) loadWebhooks(); else whStatus('Toggle failed', false);
             }};
+
             window.testWH = async function(id) {{
-                whStatus('Sending test…', true);
+                const statusEl = document.getElementById('wh-test-status-'+id);
+                if (statusEl) {{ statusEl.textContent = '🔄 Sending test…'; statusEl.style.color='#888'; }}
+                whStatus('Sending test to webhook…', true);
                 const r = await fetch('/admin/webhooks/test-single', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id}}),credentials:'same-origin'}});
                 const d = await r.json().catch(()=>({{}}));
-                whStatus(r.ok ? ('Test sent ✓ (HTTP '+d.status+')') : (d.error||'Send failed'), r.ok);
+                const ok = r.ok && d.ok;
+                const msg = ok ? '✓ Test sent! HTTP ' + (d.status||'2xx') : '✗ ' + (d.error||'Send failed');
+                if (statusEl) {{
+                    statusEl.textContent = msg;
+                    statusEl.style.color = ok ? '#4ade80' : '#f87171';
+                    setTimeout(()=>{{ if(statusEl.textContent===msg) statusEl.textContent=''; }}, 5000);
+                }}
+                whStatus(ok ? 'Test sent ✓' : 'Test failed: ' + (d.error||'error'), ok);
             }};
+
             window.deleteWH = async function(id) {{
-                if (!confirm('Delete this webhook?')) return;
+                if (!confirm('Permanently delete this webhook? This cannot be undone.')) return;
                 const r = await fetch('/admin/webhooks/custom/'+id, {{method:'DELETE',credentials:'same-origin'}});
-                if (r.ok) loadWebhooks(); else whStatus('Delete failed', false);
+                if (r.ok) {{ whStatus('Webhook deleted.', true); loadWebhooks(); }}
+                else whStatus('Delete failed', false);
             }};
+
+            document.getElementById('wh-test-url-btn').addEventListener('click', async ()=>{{
+                const url = document.getElementById('wh-url-input').value.trim();
+                if (!url) {{ whStatus('Enter a URL above to test it.', false); return; }}
+                if (!url.startsWith('http')) {{ whStatus('URL must start with http:// or https://', false); return; }}
+                whStatus('🔄 Sending test to URL…', true);
+                const r = await fetch('/admin/webhooks/test-url', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{url}}),credentials:'same-origin'}});
+                const d = await r.json().catch(()=>({{}}));
+                whStatus(r.ok && d.ok ? '✓ Test delivered! HTTP '+d.status : '✗ ' + (d.error||'Test failed'), r.ok && d.ok);
+            }});
 
             document.getElementById('wh-add-btn').addEventListener('click', async ()=>{{
                 const url   = document.getElementById('wh-url-input').value.trim();
                 const label = document.getElementById('wh-label-input').value.trim();
-                if (!url) {{ whStatus('URL required', false); return; }}
-                whStatus('Adding…', true);
+                if (!url) {{ whStatus('Webhook URL is required.', false); return; }}
+                if (!url.startsWith('http')) {{ whStatus('URL must start with http:// or https://', false); return; }}
+                whStatus('Adding webhook…', true);
                 const r = await fetch('/admin/webhooks/custom', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{url,label}}),credentials:'same-origin'}});
                 const d = await r.json().catch(()=>({{}}));
-                if (!r.ok) {{ whStatus(d.error||'Failed to add', false); return; }}
+                if (!r.ok) {{ whStatus(d.error||'Failed to add webhook', false); return; }}
                 document.getElementById('wh-url-input').value='';
                 document.getElementById('wh-label-input').value='';
-                whStatus('Webhook added ✓', true);
+                whStatus('✓ Webhook added and saved!', true);
                 loadWebhooks();
             }});
 
-            // Env-var webhook status
+            document.getElementById('wh-test-all-btn').addEventListener('click', async ()=>{{
+                whTestStatus('🔄 Firing test to all enabled webhooks…', true);
+                const r = await fetch('/admin/webhooks/test', {{method:'POST',credentials:'same-origin'}});
+                const d = await r.json().catch(()=>({{}}));
+                if (r.ok) {{
+                    const fired = d.fired||[];
+                    whTestStatus(fired.length ? '✓ Test sent to: ' + fired.join(', ') : '⚠ No enabled webhooks to test.', !!fired.length);
+                }} else {{
+                    whTestStatus('✗ ' + (d.error||'Test failed'), false);
+                }}
+            }});
+
+            // ── Env-var webhooks ──────────────────────────────────────────
             async function loadEnvWebhooks() {{
                 const box = document.getElementById('wh-env-box');
                 try {{
                     const r = await fetch('/admin/webhooks', {{credentials:'same-origin', cache:'no-store'}});
                     const d = await r.json();
-                    const master = d.master_enabled ? '<span style="color:#4ade80">ENABLED</span>' : '<span style="color:#f87171">DISABLED (master switch off)</span>';
-                    const lines = Object.entries(d.urls||{{}}).map(([k,v])=>
-                        `${{k.padEnd(12,' ')}}: ${{v ? '<span style="color:#4ade80">'+v+'</span>' : '<span style="color:#333">not set</span>'}}`
-                    ).join('\\n');
-                    box.innerHTML = `<div style="margin-bottom:6px;">Master: ${{master}}</div><pre style="margin:0;">${{lines}}</pre>`;
-                }} catch {{ box.textContent = 'Error loading.'; }}
+                    const master = d.master_enabled
+                        ? '<span style="color:#4ade80;font-weight:700;">● ENABLED</span>'
+                        : '<span style="color:#f87171;font-weight:700;">● DISABLED (master switch off)</span>';
+                    const lines = Object.entries(d.urls||{{}}).map(([k,v])=> {{
+                        const val = v ? `<span style="color:#4ade80">${{v}}</span>` : `<span style="color:#333">not set</span>`;
+                        return k.padEnd(14,' ') + ': ' + val;
+                    }}).join('\\n');
+                    box.innerHTML = `<div style="margin-bottom:9px;font-size:12px;">Master switch: ${{master}}</div><pre style="margin:0;font-size:11px;">${{lines}}</pre>`;
+                }} catch(e) {{ box.textContent = 'Error loading webhook config.'; }}
             }}
 
+            // ── Exec log (webhook tab) ─────────────────────────────────────
+            async function loadWhExecLog() {{
+                const box   = document.getElementById('wh-exec-log-box');
+                const slug  = document.getElementById('wh-exec-filter').value.trim();
+                const url   = '/admin/exec-log?limit=50' + (slug ? '&slug=' + encodeURIComponent(slug) : '');
+                try {{
+                    const r = await fetch(url, {{credentials:'same-origin', cache:'no-store'}});
+                    const d = await r.json();
+                    if (!r.ok) {{ box.textContent = d.error||'Error loading'; return; }}
+                    if (!d.entries.length) {{ box.textContent = 'No execution entries yet.'; return; }}
+                    box.innerHTML = d.entries.map(e=>{{
+                        const ok = e.success
+                            ? '<span style="color:#4ade80;font-weight:700;">✓</span>'
+                            : '<span style="color:#f87171;font-weight:700;">✗</span>';
+                        const ts = e.ts_str || new Date(e.timestamp*1000).toISOString().slice(0,19).replace('T',' ');
+                        return `<div style="padding:4px 0;border-bottom:1px solid #111;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;">
+                            ${{ok}}
+                            <span style="color:#555;font-size:10px;">${{ts}}</span>
+                            slug=<span style="color:#79c0ff;">${{e.slug}}</span>
+                            ip=<span style="color:#888;">${{e.ip}}</span>
+                            reason=<em style="color:#aaa;">${{e.reason||'ok'}}</em>
+                            ${{e.hwid ? '<span style="color:#666;">hwid='+e.hwid+'</span>' : ''}}
+                            ${{e.key_hint ? '<span style="color:#666;">key='+e.key_hint+'</span>' : ''}}
+                        </div>`;
+                    }}).join('');
+                }} catch(e) {{ box.textContent = 'Error: ' + e.message; }}
+            }}
+            document.getElementById('wh-exec-refresh-btn').addEventListener('click', loadWhExecLog);
+            document.getElementById('wh-exec-filter').addEventListener('keydown', e => e.key==='Enter' && loadWhExecLog());
+
+            // auto-refresh exec log every 10s while tab is visible
+            let _whExecTimer = null;
+            function startWhExecAutoRefresh() {{
+                if (_whExecTimer) clearInterval(_whExecTimer);
+                _whExecTimer = setInterval(()=>{{
+                    const tab = document.getElementById('tab-webhooks');
+                    if (tab && tab.classList.contains('active')) loadWhExecLog();
+                }}, 10000);
+            }}
+            startWhExecAutoRefresh();
+
+            // ── Live execution chart (webhook tab) ─────────────────────────
+            const whCanvas = document.getElementById('wh-exec-chart');
+            const whCtx = whCanvas ? whCanvas.getContext('2d') : null;
+            let _whChartDays = 7;
+
+            async function loadWhChart(days) {{
+                _whChartDays = days;
+                document.getElementById('wh-chart-period-label').textContent = days + ' days';
+                const statusEl = document.getElementById('wh-chart-status');
+                if (!whCtx) return;
+                try {{
+                    const r = await fetch('/admin/exec-stats?days=' + days, {{credentials:'same-origin', cache:'no-store'}});
+                    const d = await r.json();
+                    if (!r.ok) {{ if(statusEl) statusEl.textContent='Error loading chart data'; return; }}
+                    const items  = d.days || [];
+                    const labels  = items.map(i => i.date.slice(5)); // MM-DD
+                    const totals  = items.map(i => i.total);
+                    const success = items.map(i => i.success);
+                    const fails   = items.map(i => i.fail);
+                    const T = totals.reduce((a,b)=>a+b,0);
+                    const S = success.reduce((a,b)=>a+b,0);
+                    const F = fails.reduce((a,b)=>a+b,0);
+                    const rate = T > 0 ? ((S/T)*100).toFixed(1)+'%' : 'N/A';
+                    document.getElementById('wh-stat-total').textContent   = T.toLocaleString();
+                    document.getElementById('wh-stat-success').textContent = S.toLocaleString();
+                    document.getElementById('wh-stat-fail').textContent    = F.toLocaleString();
+                    document.getElementById('wh-stat-rate').textContent    = rate;
+                    if(statusEl) statusEl.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+
+                    // draw chart
+                    const W = whCanvas.offsetWidth * (window.devicePixelRatio||1);
+                    const H = 220 * (window.devicePixelRatio||1);
+                    whCanvas.width  = W;
+                    whCanvas.height = H;
+                    whCtx.scale(window.devicePixelRatio||1, window.devicePixelRatio||1);
+                    const CW = whCanvas.offsetWidth, CH = 220;
+                    const pad = {{l:48,r:16,t:24,b:42}};
+                    const maxV = Math.max(...totals, 1);
+                    whCtx.clearRect(0,0,CW,CH);
+                    whCtx.fillStyle='#0a0d12'; whCtx.fillRect(0,0,CW,CH);
+
+                    // grid lines
+                    const gridSteps = 4;
+                    for (let g=0;g<=gridSteps;g++) {{
+                        const y = pad.t + (CH-pad.t-pad.b)*(1-g/gridSteps);
+                        whCtx.strokeStyle = g===0 ? '#1a2030' : '#141820';
+                        whCtx.lineWidth = 1;
+                        whCtx.beginPath(); whCtx.moveTo(pad.l,y); whCtx.lineTo(CW-pad.r,y); whCtx.stroke();
+                        whCtx.fillStyle='#444'; whCtx.font='10px monospace'; whCtx.textAlign='right';
+                        whCtx.fillText(Math.round(maxV*g/gridSteps), pad.l-6, y+4);
+                    }}
+
+                    const n = labels.length;
+                    const barW = (CW - pad.l - pad.r) / Math.max(n,1);
+                    for (let i=0;i<n;i++) {{
+                        const x = pad.l + i*barW;
+                        const aH = CH-pad.t-pad.b;
+                        const bT = (totals[i]/maxV)*aH;
+                        const bS = (success[i]/maxV)*aH;
+                        const bF = (fails[i]/maxV)*aH;
+                        const gap = Math.max(2, barW*0.12);
+                        const bw  = barW - gap*2;
+
+                        // total bar (background glow)
+                        whCtx.fillStyle='rgba(99,102,241,0.12)';
+                        whCtx.fillRect(x+gap, CH-pad.b-bT, bw, bT);
+
+                        // success bar
+                        if (bS > 0) {{
+                            whCtx.fillStyle='rgba(74,222,128,0.75)';
+                            const rnd=Math.min(3,bw/2);
+                            whCtx.beginPath();
+                            whCtx.roundRect ? whCtx.roundRect(x+gap,CH-pad.b-bS,bw,bS,rnd)
+                                            : whCtx.rect(x+gap,CH-pad.b-bS,bw,bS);
+                            whCtx.fill();
+                        }}
+
+                        // fail bar (stacked at bottom-left half)
+                        if (bF > 0) {{
+                            whCtx.fillStyle='rgba(248,113,113,0.80)';
+                            whCtx.fillRect(x+gap, CH-pad.b-bF, bw*0.4, bF);
+                        }}
+
+                        // date label
+                        whCtx.fillStyle= i===n-1?'#4ade80':'#3a3a4a';
+                        whCtx.font='9px monospace'; whCtx.textAlign='center';
+                        whCtx.fillText(labels[i], x+barW/2, CH-pad.b+16);
+
+                        // value label on top if > 0
+                        if (totals[i]>0) {{
+                            whCtx.fillStyle='#666'; whCtx.font='9px monospace'; whCtx.textAlign='center';
+                            whCtx.fillText(totals[i], x+barW/2, CH-pad.b-bT-4);
+                        }}
+                    }}
+
+                    // legend
+                    const ly=10;
+                    const legend=[['rgba(74,222,128,0.75)','Success'],['rgba(248,113,113,0.80)','Fail'],['rgba(99,102,241,0.3)','Total']];
+                    let lx=pad.l;
+                    legend.forEach(([c,lbl])=>{{
+                        whCtx.fillStyle=c; whCtx.fillRect(lx,ly,10,8);
+                        whCtx.fillStyle='#777'; whCtx.font='10px sans-serif'; whCtx.textAlign='left';
+                        whCtx.fillText(lbl, lx+14, ly+8);
+                        lx += 65;
+                    }});
+                }} catch(e) {{ console.warn('WH chart error', e); }}
+            }}
+
+            document.getElementById('wh-chart-7d').addEventListener('click', ()=>loadWhChart(7));
+            document.getElementById('wh-chart-30d').addEventListener('click', ()=>loadWhChart(30));
+            document.getElementById('wh-chart-refresh').addEventListener('click', ()=>loadWhChart(_whChartDays));
+
+            // ── Init all ──────────────────────────────────────────────────
             loadWebhooks();
             loadEnvWebhooks();
+            loadWhChart(7);
+            loadWhExecLog();
+
+            // Re-draw chart on resize
+            let _resizeTimer;
+            window.addEventListener('resize', ()=>{{
+                clearTimeout(_resizeTimer);
+                _resizeTimer = setTimeout(()=>loadWhChart(_whChartDays), 200);
+            }});
         }})();
         </script>
     </section>
@@ -6612,6 +7028,48 @@ async def admin_webhook_test_single(request: Request):
     return JSONResponse({"ok": True, "status": status})
 
 
+@app.post("/admin/webhooks/test-url")
+async def admin_webhook_test_url(request: Request):
+    """Fire a test Discord embed to any arbitrary webhook URL (no need to save it first)."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "expected JSON"}, status_code=400)
+    url = str(body.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"error": "url required"}, status_code=400)
+    if not re.match(r"^https?://", url):
+        return JSONResponse({"error": "invalid URL"}, status_code=400)
+    discord_payload = json.dumps({
+        "username": WEBHOOK_USERNAME,
+        "avatar_url": WEBHOOK_AVATAR_URL,
+        "embeds": [{
+            "title": "🔔 DexNotifier — URL Test",
+            "description": "This is a **direct URL test** from the DexNotifier admin panel.\n\nIf you see this message, the webhook URL is working correctly and is ready to receive script execution logs.",
+            "color": 0x4ade80,
+            "fields": [
+                {"name": "Avatar URL", "value": f"`{WEBHOOK_AVATAR_URL}`", "inline": False},
+                {"name": "Bot Name", "value": WEBHOOK_USERNAME, "inline": True},
+                {"name": "Status", "value": "✅ Delivery confirmed", "inline": True},
+            ],
+            "footer": {"text": "DexNotifier Webhook System — Test Delivery"},
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }],
+    }, ensure_ascii=False).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=discord_payload, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)[:300]})
+    return JSONResponse({"ok": True, "status": status})
+
+
 # ── Custom webhook CRUD ────────────────────────────────────────────────────────
 
 WEBHOOK_URL_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-_/?=&%#@+:]{10,2048}$")
@@ -6759,7 +7217,11 @@ def _protected_script_page_html() -> str:
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-        '<title>Protected Script — DexNotifier</title></head><body>'
+        '<title>Protected Script — DexNotifier</title>'
+        f'<link rel="icon" type="image/webp" href="{DEX_FAVICON_URL}">'
+        f'<link rel="shortcut icon" type="image/webp" href="{DEX_FAVICON_URL}">'
+        f'<link rel="apple-touch-icon" href="{DEX_FAVICON_URL}">'
+        '</head><body>'
         '<main class="wrap" style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:28px;">'
         '<div class="card" style="max-width:480px;width:100%;text-align:center;padding:38px 32px;">'
         '<div style="width:62px;height:62px;margin:0 auto 20px;border-radius:18px;display:grid;place-items:center;'
@@ -8648,36 +9110,93 @@ def _build_webhook_lua_snippet(hooks: List[Dict[str, Any]], slug: str, ip: str) 
     """
     Build a Lua snippet that fires a Discord webhook POST for each enabled
     custom webhook when the script is executed inside Roblox.
-    If no custom webhooks are enabled, returns an empty string.
+
+    The snippet is injected raw (before the user's code) so it runs first.
+    If obfuscation is toggled on for the script, _get_final_code() will
+    obfuscate the full combined output (snippet + user code) together.
+
+    Payload includes: slug, executor IP (server-side), timestamp, game PlaceId,
+    workspace name, and LocalPlayer username where available.
     """
-    enabled_urls = [h["url"] for h in hooks if h.get("enabled", True) and h.get("url")]
-    if not enabled_urls:
+    enabled_hooks = [h for h in hooks if h.get("enabled", True) and h.get("url")]
+    if not enabled_hooks:
         return ""
+
     avatar_url = WEBHOOK_AVATAR_URL
-    lines = [
-        "-- [DexNotifier Webhook Logger]",
-        "do",
-        "  local _dn_ok, _dn_http = pcall(function() return game:GetService('HttpService') end)",
-        "  if _dn_ok and _dn_http then",
-        "    local _dn_ts = tostring(os.time and os.time() or 0)",
-        f"    local _dn_slug = {json.dumps(slug)}",
-        f"    local _dn_ip = {json.dumps(ip)}",
-        f"    local _dn_av = {json.dumps(avatar_url)}",
-        "    local _dn_embed = '{\"username\":\"DexNotifier\",\"avatar_url\":\"'..(_dn_av)..'\",'",
-        "      .. '\"embeds\":[{\"title\":\"\\u25b6 Script Executed\",\"description\":'",
-        "      .. '\"**Slug:** `'.._dn_slug..'`\\\\n**Time:** `'.._dn_ts..'`\",\"color\":5046016}]}'",
-    ]
-    for url in enabled_urls:
-        lines.append(f"    pcall(function()")
-        lines.append(f"      _dn_http:RequestAsync({{")
-        lines.append(f"        Url={json.dumps(url)},")
-        lines.append(f"        Method='POST',")
-        lines.append(f"        Headers={{['Content-Type']='application/json'}},")
-        lines.append(f"        Body=_dn_embed")
-        lines.append(f"      }})")
-        lines.append(f"    end)")
-    lines += ["  end", "end", "-- [End DexNotifier Webhook Logger]", ""]
-    return "\n".join(lines)
+    username   = WEBHOOK_USERNAME
+
+    # Build one URL list in Lua table syntax
+    url_table_entries = "\n".join(
+        f"    {json.dumps(h['url'])},"
+        for h in enabled_hooks
+    )
+    label_comment = "  ".join(
+        f"-- [{h.get('label', '?')}]"
+        for h in enabled_hooks
+    )
+
+    # Color for embed: green (5046016 = 0x4D3800 → actually use 0x4ade80 decimal)
+    embed_color = 4904064  # 0x4ade80 (green)
+
+    snippet = f"""-- [DexNotifier Webhook Logger] {label_comment}
+do
+  local _dn_ok, _dn_http = pcall(function() return game:GetService('HttpService') end)
+  if _dn_ok and _dn_http then
+    -- Gather context
+    local _dn_ts   = tostring(os.time and os.time() or 0)
+    local _dn_slug = {json.dumps(slug)}
+    local _dn_ip   = {json.dumps(ip)}
+    local _dn_av   = {json.dumps(avatar_url)}
+    local _dn_user = {json.dumps(username)}
+    local _dn_game = "?"
+    local _dn_plr  = "?"
+    local _dn_ws   = "?"
+    pcall(function()
+      _dn_game = tostring(game and game.PlaceId or "?")
+      _dn_ws   = tostring(workspace and workspace.Name or "?")
+    end)
+    pcall(function()
+      local ps = game:GetService("Players")
+      local lp = ps and ps.LocalPlayer
+      if lp then _dn_plr = lp.Name end
+    end)
+    -- Build Discord embed payload
+    local _dn_desc = (
+      "**Slug:** `".._dn_slug.."`\\n"
+      .."**Time:** `".._dn_ts.."`\\n"
+      .."**IP:** `".._dn_ip.."`\\n"
+      .."**Place:** `".._dn_game.."`\\n"
+      .."**Workspace:** `".._dn_ws.."`\\n"
+      .."**Player:** `".._dn_plr.."`"
+    )
+    local _dn_payload = (
+      '{{"username":"'.._dn_user..'","avatar_url":"'.._dn_av..'",'
+      ..'"embeds":[{{"title":"\\u25b6 Script Executed \\u2014 '.._dn_slug..'",'
+      ..'"description":"'.._dn_desc..'",'
+      ..'"color":{embed_color},'
+      ..'"footer":{{"text":"DexNotifier \\u00b7 Execution Logger"}},'
+      ..'"timestamp":"'..(os.date and os.date("!%Y-%m-%dT%H:%M:%SZ") or _dn_ts)..'"'
+      ..'}}]}}'
+    )
+    -- Fire each webhook URL
+    local _dn_urls = {{
+{url_table_entries}
+    }}
+    for _, _dn_url in ipairs(_dn_urls) do
+      pcall(function()
+        _dn_http:RequestAsync({{
+          Url    = _dn_url,
+          Method = "POST",
+          Headers = {{["Content-Type"] = "application/json"}},
+          Body   = _dn_payload,
+        }})
+      end)
+    end
+  end
+end
+-- [End DexNotifier Webhook Logger]
+"""
+    return snippet
 
 
 async def _get_final_code(code: str, slug: str, ip: str, obfuscate_flag: bool) -> str:
@@ -8737,24 +9256,28 @@ async def dynamic_loader(slug: str, request: Request):
             log.debug(f"[LOADER] not_found slug={slug} ip={ip}")
             return PlainTextResponse("-- Script not found.")
 
-        code             = s.get("code", "")
-        is_paid          = s.get("is_paid", False)
-        hwid_lock        = s.get("hwid_lock", False)
-        script_enabled   = s.get("script_enabled", True)
-        log_executions   = s.get("log_executions", False)
-        actual_slug      = s.get("slug", slug)
-        obfuscate_flag   = s.get("obfuscate", False)
+        code              = s.get("code", "")
+        is_paid           = s.get("is_paid", False)
+        hwid_lock         = s.get("hwid_lock", False)
+        script_enabled    = s.get("script_enabled", True)
+        log_executions    = s.get("log_executions", False)
+        actual_slug       = s.get("slug", slug)
+        obfuscate_flag    = s.get("obfuscate", False)
+        # Per-script Discord webhook for execution logs (owner-set on /home)
+        _exec_wh_url      = s.get("exec_webhook_url", "") if log_executions else ""
 
     # ── Per-script enabled toggle ─────────────────────────────────────────
     if not script_enabled:
         if log_executions and toggle("execution_logging"):
-            await record_execution(actual_slug, ip, False, "script_disabled")
+            await record_execution(actual_slug, ip, False, "script_disabled",
+                                   exec_webhook_url=_exec_wh_url)
         return PlainTextResponse("-- This script is currently disabled.")
 
     # ── Free (no key required) path ───────────────────────────────────────
     if not is_paid or not toggle("paid_key_validation"):
         if log_executions and toggle("execution_logging"):
-            await record_execution(actual_slug, ip, True, "free")
+            await record_execution(actual_slug, ip, True, "free",
+                                   exec_webhook_url=_exec_wh_url)
         log.info(f"[LOADER] served slug={actual_slug} ip={ip} type=free")
         final_code = await _get_final_code(code, actual_slug, ip, obfuscate_flag)
         return PlainTextResponse(final_code)
@@ -8768,11 +9291,13 @@ async def dynamic_loader(slug: str, request: Request):
 
     if not key:
         if log_executions and toggle("execution_logging"):
-            await record_execution(actual_slug, ip, False, "missing_key")
+            await record_execution(actual_slug, ip, False, "missing_key",
+                                   exec_webhook_url=_exec_wh_url)
         return PlainTextResponse("-- Missing paid key.")
     if hwid_lock and toggle("hwid_enforcement") and not hwid:
         if log_executions and toggle("execution_logging"):
-            await record_execution(actual_slug, ip, False, "missing_hwid")
+            await record_execution(actual_slug, ip, False, "missing_hwid",
+                                   exec_webhook_url=_exec_wh_url)
         return PlainTextResponse("-- Missing HWID for locked script.")
 
     async with scripts_lock:
@@ -8790,7 +9315,8 @@ async def dynamic_loader(slug: str, request: Request):
         if matched_key is None:
             await record_failed_attempt("slug_key_guess", ip)
             if log_executions and toggle("execution_logging"):
-                await record_execution(actual_slug, ip, False, "invalid_key", hwid=hwid, key=key)
+                await record_execution(actual_slug, ip, False, "invalid_key", hwid=hwid, key=key,
+                                       exec_webhook_url=_exec_wh_url)
             log.info(f"[LOADER] invalid_key slug={actual_slug} ip={ip}")
             return PlainTextResponse("-- Invalid paid key.")
 
@@ -8804,7 +9330,8 @@ async def dynamic_loader(slug: str, request: Request):
             s["keys"] = keys
             save_scripts_to_file()
             if log_executions and toggle("execution_logging"):
-                await record_execution(actual_slug, ip, False, "key_expired", hwid=hwid, key=key)
+                await record_execution(actual_slug, ip, False, "key_expired", hwid=hwid, key=key,
+                                       exec_webhook_url=_exec_wh_url)
             log.info(f"[LOADER] key_expired slug={actual_slug} ip={ip}")
             return PlainTextResponse("-- Paid key expired.")
 
@@ -8818,14 +9345,16 @@ async def dynamic_loader(slug: str, request: Request):
             elif not constant_time_eq(bound_hwid, hwid):
                 await record_failed_attempt("slug_key_guess", ip)
                 if log_executions and toggle("execution_logging"):
-                    await record_execution(actual_slug, ip, False, "hwid_mismatch", hwid=hwid, key=key)
+                    await record_execution(actual_slug, ip, False, "hwid_mismatch", hwid=hwid, key=key,
+                                           exec_webhook_url=_exec_wh_url)
                 log.info(f"[LOADER] hwid_mismatch slug={actual_slug} ip={ip}")
                 return PlainTextResponse("-- HWID mismatch for this key.")
 
     await clear_attempts("slug_key_guess", ip)
 
     if log_executions and toggle("execution_logging"):
-        await record_execution(actual_slug, ip, True, "paid", hwid=hwid, key=key)
+        await record_execution(actual_slug, ip, True, "paid", hwid=hwid, key=key,
+                               exec_webhook_url=_exec_wh_url)
     log.info(f"[LOADER] served slug={actual_slug} ip={ip} type=paid")
     final_code = await _get_final_code(code, actual_slug, ip, obfuscate_flag)
     return PlainTextResponse(final_code)
