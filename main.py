@@ -9106,69 +9106,729 @@ SLUG_LOADER_RATE_LIMIT = 30
 SLUG_LOADER_RATE_WINDOW = 10.0
 
 
-def _build_webhook_lua_snippet(hooks: List[Dict[str, Any]], slug: str, ip: str) -> str:
+# ═════════════════════════════════════════════════════════════════════════════
+# PER-SCRIPT EXECUTION RETURNS — /return/{slug}
+# Roblox scripts POST execution telemetry here.  The payload is stored
+# per-script and optionally obfuscated before storage when the script's
+# obfuscate flag is on.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# In-memory store: slug -> list of execution records (capped at 500)
+_script_exec_returns: Dict[str, List[Dict[str, Any]]] = {}
+_script_exec_returns_lock = asyncio.Lock()
+MAX_EXEC_RETURNS_PER_SCRIPT = 500
+
+# Per-script daily execution stats  slug -> {"YYYY-MM-DD": {"total":int,"success":int}}
+_script_daily_stats: Dict[str, Dict[str, Dict[str, int]]] = {}
+_script_daily_stats_lock = asyncio.Lock()
+
+
+async def _record_script_return(slug: str, record: Dict[str, Any]) -> None:
+    """Store one execution return record for the given slug."""
+    async with _script_exec_returns_lock:
+        if slug not in _script_exec_returns:
+            _script_exec_returns[slug] = []
+        _script_exec_returns[slug].append(record)
+        if len(_script_exec_returns[slug]) > MAX_EXEC_RETURNS_PER_SCRIPT:
+            _script_exec_returns[slug] = _script_exec_returns[slug][-MAX_EXEC_RETURNS_PER_SCRIPT:]
+    # Track daily stats
+    day = time.strftime("%Y-%m-%d", time.gmtime(record.get("ts", time.time())))
+    async with _script_daily_stats_lock:
+        if slug not in _script_daily_stats:
+            _script_daily_stats[slug] = {}
+        if day not in _script_daily_stats[slug]:
+            _script_daily_stats[slug][day] = {"total": 0, "success": 0, "fail": 0}
+        _script_daily_stats[slug][day]["total"] += 1
+        if record.get("success", True):
+            _script_daily_stats[slug][day]["success"] += 1
+        else:
+            _script_daily_stats[slug][day]["fail"] += 1
+        # Keep only last 35 days per script
+        if len(_script_daily_stats[slug]) > 35:
+            oldest = sorted(_script_daily_stats[slug].keys())[0]
+            del _script_daily_stats[slug][oldest]
+
+
+def _obf_string(s: str) -> str:
+    """Very lightweight string obfuscation for storing sensitive fields."""
+    if not s:
+        return ""
+    encoded = s.encode("utf-8")
+    key = 0x5D
+    return "".join(f"{b ^ key:02x}" for b in encoded)
+
+
+def _deobf_string(s: str) -> str:
+    """Reverse _obf_string."""
+    if not s:
+        return ""
+    try:
+        key = 0x5D
+        return bytes(int(s[i:i+2], 16) ^ key for i in range(0, len(s), 2)).decode("utf-8", errors="replace")
+    except Exception:
+        return s
+
+
+@app.post("/return/{slug}")
+async def script_return(slug: str, request: Request):
     """
-    Build a Lua snippet that fires a Discord webhook POST for each enabled
-    custom webhook when the script is executed inside Roblox.
+    Roblox scripts POST execution telemetry here.
+    Expected JSON body (all fields optional except slug):
+      { player_name, place_id, exec_time_ms, success, note }
+    """
+    ip = _client_ip(request)
+    if rate_limited(ip, f"script_return_{slug}", max_requests=30, window_seconds=10.0):
+        return JSONResponse({"error": "rate limited"}, status_code=429)
 
-    The snippet is injected raw (before the user's code) so it runs first.
-    If obfuscation is toggled on for the script, _get_final_code() will
-    obfuscate the full combined output (snippet + user code) together.
+    if reject_if_oversized(request, 4096):
+        return JSONResponse({"error": "payload too large"}, status_code=413)
 
-    Payload includes: slug, executor IP (server-side), timestamp, game PlaceId,
-    workspace name, and LocalPlayer username where available.
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "expected JSON"}, status_code=400)
+
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+
+    # Find script and check obfuscate flag
+    async with scripts_lock:
+        s = scripts.get(slug)
+        if not s:
+            for k, v in scripts.items():
+                if k.lower() == slug.lower():
+                    s = v
+                    break
+
+    if not s:
+        return JSONResponse({"error": "script not found"}, status_code=404)
+
+    obfuscate_flag = s.get("obfuscate", False)
+    log_executions = s.get("log_executions", False)
+
+    if not log_executions:
+        return JSONResponse({"ok": True, "note": "logging disabled"})
+
+    player_name  = str(body.get("player_name", "?"))[:64]
+    place_id     = str(body.get("place_id", "?"))[:32]
+    exec_time_ms = str(body.get("exec_time_ms", "?"))[:16]
+    success      = bool(body.get("success", True))
+    note         = str(body.get("note", ""))[:256]
+    ts_now       = time.time()
+
+    if obfuscate_flag:
+        # Store obfuscated versions
+        record = {
+            "ts": ts_now,
+            "ts_str": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_now)),
+            "player_name": _obf_string(player_name),
+            "place_id": _obf_string(place_id),
+            "exec_time_ms": _obf_string(exec_time_ms),
+            "ip": _obf_string(ip),
+            "success": success,
+            "note": _obf_string(note),
+            "obfuscated": True,
+        }
+    else:
+        record = {
+            "ts": ts_now,
+            "ts_str": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_now)),
+            "player_name": player_name,
+            "place_id": place_id,
+            "exec_time_ms": exec_time_ms,
+            "ip": ip,
+            "success": success,
+            "note": note,
+            "obfuscated": False,
+        }
+
+    await _record_script_return(slug, record)
+
+    # Fire per-script webhooks with execution data
+    exec_webhook_url = s.get("exec_webhook_url", "") if log_executions else ""
+    if exec_webhook_url:
+        asyncio.create_task(_fire_per_script_exec_webhook({
+            "slug": slug,
+            "ip": ip if not obfuscate_flag else "[obfuscated]",
+            "ts_str": record["ts_str"],
+            "success": success,
+            "reason": note or "execution",
+            "player_name": player_name if not obfuscate_flag else "[obfuscated]",
+            "place_id": place_id if not obfuscate_flag else "[obfuscated]",
+            "exec_time_ms": exec_time_ms if not obfuscate_flag else "[obfuscated]",
+        }, exec_webhook_url))
+
+    return JSONResponse({"ok": True})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /details/{slug} — Script detail page
+# Shows: exec chart (7d/30d), webhooks list, add webhook, test webhook,
+#        execution log table, total executions, last executed.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/details/{slug}")
+async def script_details_page(slug: str, request: Request):
+    ip = _client_ip(request)
+    if rate_limited(ip, "details_get", max_requests=20, window_seconds=10.0):
+        return PlainTextResponse("RATE_LIMITED", status_code=429)
+
+    current_user = get_logged_in_user(request)
+    if not current_user:
+        return RedirectResponse(url="/home", status_code=302)
+
+    async with scripts_lock:
+        s = scripts.get(slug)
+        if not s:
+            for k, v in scripts.items():
+                if k.lower() == slug.lower():
+                    s = v
+                    slug = k
+                    break
+
+    if not s or s.get("owner") != current_user:
+        return HTMLResponse("<h2 style='color:#f87171;font-family:Inter,sans-serif;padding:40px'>Script not found or not owned by you.</h2>", status_code=404)
+
+    name             = s.get("name", slug)
+    obfuscate_flag   = s.get("obfuscate", False)
+    log_executions   = s.get("log_executions", False)
+    exec_webhook_url = s.get("exec_webhook_url", "")
+    # Per-script webhooks (stored on script object under "webhooks" key)
+    per_script_hooks = s.get("webhooks", [])  # list of {id, url, label, enabled}
+
+    # Gather execution returns for this slug
+    async with _script_exec_returns_lock:
+        exec_records = list(_script_exec_returns.get(slug, []))
+
+    # Gather daily stats
+    async with _script_daily_stats_lock:
+        daily = dict(_script_daily_stats.get(slug, {}))
+
+    # Also count from exec_log (server-side records)
+    async with _exec_log_lock:
+        server_execs = [e for e in _exec_log if e.get("slug") == slug]
+
+    total_execs = len(exec_records) + len(server_execs)
+    last_exec_str = "Never"
+    all_ts = [r.get("ts", 0) for r in exec_records] + [e.get("timestamp", 0) for e in server_execs]
+    if all_ts:
+        last_ts = max(all_ts)
+        last_exec_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(last_ts))
+
+    # Build 30-day chart data
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    chart_labels_30 = []
+    chart_data_30   = []
+    for i in range(29, -1, -1):
+        d = time.strftime("%Y-%m-%d", time.gmtime(time.time() - i * 86400))
+        chart_labels_30.append(d[5:])  # MM-DD
+        chart_data_30.append(daily.get(d, {}).get("total", 0))
+
+    chart_labels_7 = chart_labels_30[-7:]
+    chart_data_7   = chart_data_30[-7:]
+
+    # Build execution log rows HTML
+    log_rows_html = ""
+    display_records = list(reversed(exec_records[-100:]))  # newest first
+    if display_records:
+        for rec in display_records:
+            obf = rec.get("obfuscated", False)
+            def display_field(val):
+                if obf:
+                    return '<span style="color:#f59e0b;font-size:11px">[obfuscated]</span>'
+                return html.escape(str(val or "?"))
+
+            ok_icon = "✅" if rec.get("success", True) else "❌"
+            log_rows_html += f"""<tr>
+<td style="color:#888;font-size:11px">{html.escape(rec.get('ts_str','?'))}</td>
+<td>{display_field(rec.get('player_name','?'))}</td>
+<td>{display_field(rec.get('place_id','?'))}</td>
+<td>{display_field(rec.get('exec_time_ms','?'))}</td>
+<td>{display_field(rec.get('ip','?'))}</td>
+<td style="text-align:center">{ok_icon}</td>
+</tr>"""
+    else:
+        log_rows_html = '<tr><td colspan="6" style="text-align:center;color:#555;padding:20px">No executions logged yet.</td></tr>'
+
+    # Build webhooks list HTML
+    hooks_rows_html = ""
+    for hook in per_script_hooks:
+        hid    = html.escape(hook.get("id",""))
+        hlabel = html.escape(hook.get("label",""))
+        hurl   = html.escape(hook.get("url",""))
+        henabled = hook.get("enabled", True)
+        hooks_rows_html += f"""<tr id="hook-row-{hid}">
+<td style="color:#ccc">{hlabel}</td>
+<td style="font-family:monospace;font-size:11px;color:#888;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{hurl}">{hurl}</td>
+<td><span class="pill {'green' if henabled else 'red'}">"{'On' if henabled else 'Off'}"</span></td>
+<td style="white-space:nowrap;display:flex;gap:6px;padding:8px 0">
+  <button onclick="testWebhook('{hid}','{hurl}')" style="background:#1a2e1a;color:#4ade80;border-color:#1a3a1a;font-size:11px;padding:4px 9px">Test</button>
+  <button onclick="deleteWebhook('{hid}')" style="background:#2a0a0a;color:#f87171;border-color:#3a1a1a;font-size:11px;padding:4px 9px">Delete</button>
+</td>
+</tr>"""
+
+    if not hooks_rows_html:
+        hooks_rows_html = '<tr><td colspan="4" style="text-align:center;color:#555;padding:16px">No webhooks added yet.</td></tr>'
+
+    page_html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Details — {html.escape(name)} — DexNotifier</title>
+<link rel="icon" type="image/webp" href="https://cdn.discordapp.com/icons/1505354277848219758/a6a84873eb83095e937b0051df49f5dc.webp?size=1536">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" defer></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+html,body{{min-height:100vh;background:#0d0d0d;color:#ccc;font-family:Inter,ui-sans-serif,system-ui,sans-serif;font-size:14px}}
+a{{color:#666;text-decoration:none;transition:color .15s}}
+a:hover{{color:#ccc}}
+.wrap{{max-width:1100px;margin:0 auto;padding:32px 20px 60px}}
+.back-link{{display:inline-flex;align-items:center;gap:6px;color:#555;font-size:13px;margin-bottom:22px;transition:color .15s}}
+.back-link:hover{{color:#ccc}}
+.page-title{{font-size:22px;font-weight:700;color:#fff;margin-bottom:4px}}
+.page-sub{{font-size:13px;color:#555;margin-bottom:24px}}
+.stats-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:24px}}
+.stat-box{{background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:16px}}
+.stat-value{{font-size:22px;font-weight:700;color:#fff}}
+.stat-label{{font-size:11px;color:#555;margin-top:3px}}
+.section{{background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:20px;margin-bottom:18px}}
+.section-title{{font-size:14px;font-weight:600;color:#fff;margin-bottom:14px;display:flex;align-items:center;gap:8px}}
+.section-title .badge{{font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;background:#1e1e1e;color:#888;border:1px solid #2a2a2a}}
+.chart-tabs{{display:flex;gap:6px;margin-bottom:14px}}
+.chart-tab{{padding:5px 12px;border-radius:5px;border:1px solid #222;background:#0d0d0d;color:#555;font-size:12px;cursor:pointer;font-family:inherit;transition:.15s}}
+.chart-tab.active{{background:#1e1e1e;color:#fff;border-color:#333}}
+.chart-wrap{{position:relative;height:200px;width:100%}}
+.pill{{border-radius:999px;padding:3px 10px;font-size:11px;display:inline-block;border:1px solid #222;background:#1e1e1e;color:#888}}
+.pill.green{{color:#4ade80;border-color:#1a3a1a;background:#0d1f0d}}
+.pill.red{{color:#f87171;border-color:#3a1a1a;background:#1f0d0d}}
+table{{width:100%;border-collapse:collapse}}
+th{{text-align:left;padding:8px 12px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#444;border-bottom:1px solid #1e1e1e}}
+td{{padding:9px 12px;border-bottom:1px solid #161616;vertical-align:middle;font-size:12px}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:#141414}}
+input{{background:#0d0d0d;color:#ccc;border:1px solid #222;border-radius:6px;padding:8px 12px;font-size:13px;font-family:inherit;outline:none;transition:border-color .15s;width:100%}}
+input:focus{{border-color:#444}}
+button{{background:#1e1e1e;color:#ccc;border:1px solid #222;border-radius:6px;padding:8px 14px;font-size:13px;font-family:inherit;cursor:pointer;transition:.15s;font-weight:500}}
+button:hover{{background:#252525;border-color:#333;color:#fff}}
+.add-hook-row{{display:grid;grid-template-columns:1fr 1fr auto auto;gap:8px;align-items:end;margin-top:10px}}
+.toast{{position:fixed;bottom:20px;right:20px;z-index:999;padding:11px 16px;border-radius:8px;background:#1a1a1a;border:1px solid #2a2a2a;color:#ccc;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.4);animation:toastIn .2s ease both}}
+@keyframes toastIn{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
+.exec-return-note{{font-size:11px;color:#555;margin-top:8px;font-family:ui-monospace,monospace}}
+@media(max-width:700px){{.add-hook-row{{grid-template-columns:1fr 1fr;grid-template-rows:auto auto}}}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back-link" href="/home">← Back to Dashboard</a>
+  <div class="page-title">{html.escape(name)}</div>
+  <div class="page-sub">Script ID: <code style="font-family:monospace;color:#888">{html.escape(slug)}</code> · {'<span style="color:#22d3ee">Obfuscated</span>' if obfuscate_flag else '<span style="color:#555">Plain</span>'} · {'<span style="color:#4ade80">Logging On</span>' if log_executions else '<span style="color:#555">Logging Off</span>'}</div>
+
+  <!-- Stats -->
+  <div class="stats-grid">
+    <div class="stat-box">
+      <div class="stat-value" id="stat-total">{total_execs}</div>
+      <div class="stat-label">Total Executions</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-value" id="stat-last" style="font-size:13px;padding-top:4px">{html.escape(last_exec_str)}</div>
+      <div class="stat-label">Last Executed</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-value">{len(per_script_hooks)}</div>
+      <div class="stat-label">Webhooks</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-value" style="color:{'#22d3ee' if obfuscate_flag else '#555'}">{('Yes' if obfuscate_flag else 'No')}</div>
+      <div class="stat-label">Obfuscated</div>
+    </div>
+  </div>
+
+  <!-- Execution Chart -->
+  <div class="section">
+    <div class="section-title">
+      Execution Chart
+      <div class="chart-tabs">
+        <button class="chart-tab active" onclick="switchChart('7d',this)">7 Days</button>
+        <button class="chart-tab" onclick="switchChart('30d',this)">30 Days</button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="execChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Webhooks -->
+  <div class="section">
+    <div class="section-title">
+      Webhooks
+      <span class="badge">{len(per_script_hooks)}</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>Label</th>
+        <th>URL</th>
+        <th>Status</th>
+        <th>Actions</th>
+      </tr></thead>
+      <tbody id="hooks-tbody">
+        {hooks_rows_html}
+      </tbody>
+    </table>
+    <div class="add-hook-row" style="margin-top:14px">
+      <div><label style="font-size:11px;color:#555;display:block;margin-bottom:4px">Label</label>
+        <input id="new-hook-label" placeholder="e.g. My Discord" maxlength="48"></div>
+      <div><label style="font-size:11px;color:#555;display:block;margin-bottom:4px">Webhook URL</label>
+        <input id="new-hook-url" placeholder="https://discord.com/api/webhooks/..." maxlength="512"></div>
+      <div style="align-self:end"><button onclick="addWebhook()" style="background:#1a2e1a;color:#4ade80;border-color:#1a3a1a">Add Webhook</button></div>
+      <div style="align-self:end"><button id="test-new-btn" onclick="testNewWebhook()" style="background:#1a1a2e;color:#a78bfa;border-color:#2a2a5a">Test URL</button></div>
+    </div>
+  </div>
+
+  <!-- Execution Logs -->
+  <div class="section">
+    <div class="section-title">
+      Execution Logs
+      <span class="badge">Last 100</span>
+      {'<span class="badge" style="color:#f59e0b;border-color:#3a2000;background:#1a0e00">Obfuscated Data</span>' if obfuscate_flag else ''}
+    </div>
+    {'<div style="font-size:12px;color:#f59e0b;margin-bottom:10px;padding:8px 12px;background:#1a0e00;border:1px solid #3a2000;border-radius:6px">⚠ This script has obfuscation enabled. All execution data (player name, place ID, IP, exec time) is stored obfuscated.</div>' if obfuscate_flag else ''}
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>Time</th>
+          <th>Player</th>
+          <th>Place ID</th>
+          <th>Exec Time (ms)</th>
+          <th>IP</th>
+          <th>OK</th>
+        </tr></thead>
+        <tbody id="exec-log-tbody">
+          {log_rows_html}
+        </tbody>
+      </table>
+    </div>
+    <div class="exec-return-note">
+      The /return endpoint for this script: <code>{html.escape(BASE_URL)}/return/{html.escape(slug)}</code><br>
+      Your Lua script should POST to this URL with player_name, place_id, exec_time_ms fields.
+    </div>
+  </div>
+</div>
+
+<script>
+const SLUG = {json.dumps(slug)};
+const CHART_7D  = {json.dumps(chart_labels_7)};
+const DATA_7D   = {json.dumps(chart_data_7)};
+const CHART_30D = {json.dumps(chart_labels_30)};
+const DATA_30D  = {json.dumps(chart_data_30)};
+
+let currentChart = null;
+let currentRange = '7d';
+
+window.addEventListener('DOMContentLoaded', () => {{
+  // Wait for Chart.js to load (it's deferred)
+  const tryInit = () => {{
+    if (typeof Chart === 'undefined') {{ setTimeout(tryInit, 50); return; }}
+    buildChart('7d');
+  }};
+  tryInit();
+}});
+
+function buildChart(range) {{
+  const ctx = document.getElementById('execChart').getContext('2d');
+  if (currentChart) currentChart.destroy();
+  const labels = range === '7d' ? CHART_7D : CHART_30D;
+  const data   = range === '7d' ? DATA_7D  : DATA_30D;
+  currentChart = new Chart(ctx, {{
+    type: 'bar',
+    data: {{
+      labels,
+      datasets: [{{
+        label: 'Executions',
+        data,
+        backgroundColor: 'rgba(74,222,128,0.25)',
+        borderColor: 'rgba(74,222,128,0.8)',
+        borderWidth: 1,
+        borderRadius: 3,
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{ legend: {{ display: false }}, tooltip: {{ callbacks: {{ title: i => i[0].label }} }} }},
+      scales: {{
+        x: {{ grid: {{ color: 'rgba(255,255,255,0.04)' }}, ticks: {{ color: '#555', font: {{ size: 10 }} }} }},
+        y: {{ grid: {{ color: 'rgba(255,255,255,0.04)' }}, ticks: {{ color: '#555', font: {{ size: 10 }}, stepSize: 1 }}, beginAtZero: true }}
+      }}
+    }}
+  }});
+}}
+
+function switchChart(range, btn) {{
+  currentRange = range;
+  document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  buildChart(range);
+}}
+
+function toast(msg, ok=true) {{
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  el.style.borderColor = ok ? '#1a3a1a' : '#3a1a1a';
+  el.style.color = ok ? '#4ade80' : '#f87171';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}}
+
+async function addWebhook() {{
+  const label = document.getElementById('new-hook-label').value.trim();
+  const url   = document.getElementById('new-hook-url').value.trim();
+  if (!url) {{ toast('Enter a webhook URL', false); return; }}
+  const r = await fetch('/api/scripts/' + SLUG + '/webhooks', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{label: label || 'Webhook', url}})
+  }});
+  const d = await r.json();
+  if (d.ok) {{
+    toast('Webhook added!');
+    document.getElementById('new-hook-label').value = '';
+    document.getElementById('new-hook-url').value = '';
+    setTimeout(() => location.reload(), 800);
+  }} else {{
+    toast(d.error || 'Failed to add webhook', false);
+  }}
+}}
+
+async function deleteWebhook(hookId) {{
+  if (!confirm('Delete this webhook?')) return;
+  const r = await fetch('/api/scripts/' + SLUG + '/webhooks/' + hookId, {{method:'DELETE'}});
+  const d = await r.json();
+  if (d.ok) {{
+    toast('Webhook deleted!');
+    setTimeout(() => location.reload(), 600);
+  }} else {{
+    toast(d.error || 'Failed', false);
+  }}
+}}
+
+async function testWebhook(hookId, url) {{
+  toast('Sending test...', true);
+  const r = await fetch('/api/scripts/' + SLUG + '/webhooks/' + hookId + '/test', {{method:'POST'}});
+  const d = await r.json();
+  if (d.ok) {{ toast('Test sent! Check your Discord.'); }}
+  else {{ toast(d.error || 'Test failed', false); }}
+}}
+
+async function testNewWebhook() {{
+  const url = document.getElementById('new-hook-url').value.trim();
+  if (!url) {{ toast('Enter a URL first', false); return; }}
+  toast('Sending test...', true);
+  const r = await fetch('/api/webhooks/test', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{url}})
+  }});
+  const d = await r.json();
+  if (d.ok) {{ toast('Test sent! Check your Discord.'); }}
+  else {{ toast(d.error || 'Test failed', false); }}
+}}
+</script>
+</body>
+</html>"""
+
+    return HTMLResponse(page_html)
+
+
+# ─── Per-script webhook API endpoints (used by /details JS) ──────────────────
+
+@app.post("/api/scripts/{slug}/webhooks")
+async def api_add_script_webhook(slug: str, request: Request):
+    current_user = get_logged_in_user(request)
+    if not current_user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+
+    url   = str(body.get("url", "")).strip()[:512]
+    label = str(body.get("label", "Webhook")).strip()[:64]
+
+    if not url:
+        return JSONResponse({"error": "url required"}, status_code=400)
+
+    if not re.match(r"^https?://", url):
+        return JSONResponse({"error": "invalid URL"}, status_code=400)
+
+    hook_id = secrets.token_hex(8)
+
+    async with scripts_lock:
+        s = scripts.get(slug)
+        if not s or s.get("owner") != current_user:
+            return JSONResponse({"error": "script not found"}, status_code=404)
+        hooks = s.get("webhooks", [])
+        if len(hooks) >= 10:
+            return JSONResponse({"error": "max 10 webhooks per script"}, status_code=400)
+        hooks.append({"id": hook_id, "url": url, "label": label, "enabled": True, "added_at": time.time()})
+        s["webhooks"] = hooks
+        save_scripts_to_file()
+
+    return JSONResponse({"ok": True, "id": hook_id})
+
+
+@app.delete("/api/scripts/{slug}/webhooks/{hook_id}")
+async def api_delete_script_webhook(slug: str, hook_id: str, request: Request):
+    current_user = get_logged_in_user(request)
+    if not current_user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    async with scripts_lock:
+        s = scripts.get(slug)
+        if not s or s.get("owner") != current_user:
+            return JSONResponse({"error": "script not found"}, status_code=404)
+        hooks = s.get("webhooks", [])
+        original_len = len(hooks)
+        hooks = [h for h in hooks if h.get("id") != hook_id]
+        if len(hooks) == original_len:
+            return JSONResponse({"error": "webhook not found"}, status_code=404)
+        s["webhooks"] = hooks
+        save_scripts_to_file()
+
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/scripts/{slug}/webhooks/{hook_id}/test")
+async def api_test_script_webhook(slug: str, hook_id: str, request: Request):
+    current_user = get_logged_in_user(request)
+    if not current_user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    async with scripts_lock:
+        s = scripts.get(slug)
+        if not s or s.get("owner") != current_user:
+            return JSONResponse({"error": "script not found"}, status_code=404)
+        hooks = s.get("webhooks", [])
+        hook = next((h for h in hooks if h.get("id") == hook_id), None)
+        if not hook:
+            return JSONResponse({"error": "webhook not found"}, status_code=404)
+        url = hook.get("url", "")
+
+    return await _send_test_webhook(url, slug)
+
+
+@app.post("/api/webhooks/test")
+async def api_test_raw_webhook(request: Request):
+    current_user = get_logged_in_user(request)
+    if not current_user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+
+    url = str(body.get("url", "")).strip()
+    if not url or not re.match(r"^https?://", url):
+        return JSONResponse({"error": "invalid URL"}, status_code=400)
+
+    return await _send_test_webhook(url, "test")
+
+
+async def _send_test_webhook(url: str, slug: str) -> JSONResponse:
+    """Send a test Discord embed to the given webhook URL."""
+    if not url:
+        return JSONResponse({"error": "no URL"}, status_code=400)
+
+    payload = json.dumps({
+        "username": WEBHOOK_USERNAME,
+        "avatar_url": WEBHOOK_AVATAR_URL,
+        "embeds": [{
+            "title": f"🧪 Test Webhook — {slug}",
+            "description": (
+                f"**This is a test from DexNotifier!**\n\n"
+                f"**Script:** `{slug}`\n"
+                f"**Time:** `{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}`\n\n"
+                f"If you see this, your webhook is working correctly ✅"
+            ),
+            "color": 0x4ade80,
+            "footer": {"text": "DexNotifier · Webhook Test"},
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }],
+    }, ensure_ascii=False).encode("utf-8")
+
+    try:
+        def _post():
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return resp.status
+        status = await asyncio.to_thread(_post)
+        return JSONResponse({"ok": True, "status": status})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)[:200]}, status_code=502)
+
+
+
+def _build_webhook_lua_snippet(hooks: List[Dict[str, Any]], slug: str, ip: str, obfuscate_flag: bool = False, return_url: str = "") -> str:
+    """
+    Build a Lua snippet that:
+    1. Fires a Discord webhook POST for each enabled custom webhook when the script runs in Roblox.
+    2. POSTs execution telemetry back to the /return/{slug} endpoint.
+
+    If obfuscate_flag is True, all sensitive fields (player name, place ID, etc.)
+    in the Discord embed are replaced with obfuscated placeholders. The /return
+    POST still sends full data (the server will obfuscate on its end).
     """
     enabled_hooks = [h for h in hooks if h.get("enabled", True) and h.get("url")]
-    if not enabled_hooks:
+    has_hooks     = bool(enabled_hooks)
+    has_return    = bool(return_url)
+
+    if not has_hooks and not has_return:
         return ""
 
-    avatar_url = WEBHOOK_AVATAR_URL
-    username   = WEBHOOK_USERNAME
+    avatar_url   = WEBHOOK_AVATAR_URL
+    wh_username  = WEBHOOK_USERNAME
+    embed_color  = 4904064  # 0x4ade80 green
 
-    # Build one URL list in Lua table syntax
-    url_table_entries = "\n".join(
-        f"    {json.dumps(h['url'])},"
-        for h in enabled_hooks
-    )
-    label_comment = "  ".join(
-        f"-- [{h.get('label', '?')}]"
-        for h in enabled_hooks
-    )
+    url_table_entries = ""
+    label_comment     = ""
+    if has_hooks:
+        url_table_entries = "\n".join(
+            f"    {json.dumps(h['url'])},"
+            for h in enabled_hooks
+        )
+        label_comment = "  ".join(f"-- [{h.get('label','?')}]" for h in enabled_hooks)
 
-    # Color for embed: green (5046016 = 0x4D3800 → actually use 0x4ade80 decimal)
-    embed_color = 4904064  # 0x4ade80 (green)
+    # Whether to show real player/place data in Discord embeds
+    if obfuscate_flag:
+        desc_fields = (
+            '"**Slug:** `" .. _dn_slug .. "`\\n"'
+            '.."**Time:** `" .. _dn_ts .. "`\\n"'
+            '.."**IP:** `[obfuscated]`\\n"'
+            '.."**Place:** `[obfuscated]`\\n"'
+            '.."**Player:** `[obfuscated]`"'
+        )
+    else:
+        desc_fields = (
+            '"**Slug:** `" .. _dn_slug .. "`\\n"'
+            '.."**Time:** `" .. _dn_ts .. "`\\n"'
+            '.."**IP:** `" .. _dn_ip .. "`\\n"'
+            '.."**Place:** `" .. _dn_game .. "`\\n"'
+            '.."**Player:** `" .. _dn_plr .. "`"'
+        )
 
-    snippet = f"""-- [DexNotifier Webhook Logger] {label_comment}
-do
-  local _dn_ok, _dn_http = pcall(function() return game:GetService('HttpService') end)
-  if _dn_ok and _dn_http then
-    -- Gather context
-    local _dn_ts   = tostring(os.time and os.time() or 0)
-    local _dn_slug = {json.dumps(slug)}
-    local _dn_ip   = {json.dumps(ip)}
-    local _dn_av   = {json.dumps(avatar_url)}
-    local _dn_user = {json.dumps(username)}
-    local _dn_game = "?"
-    local _dn_plr  = "?"
-    local _dn_ws   = "?"
-    pcall(function()
-      _dn_game = tostring(game and game.PlaceId or "?")
-      _dn_ws   = tostring(workspace and workspace.Name or "?")
-    end)
-    pcall(function()
-      local ps = game:GetService("Players")
-      local lp = ps and ps.LocalPlayer
-      if lp then _dn_plr = lp.Name end
-    end)
+    return_url_lua = json.dumps(return_url) if has_return else '""'
+
+    webhook_block = ""
+    if has_hooks:
+        webhook_block = f"""
     -- Build Discord embed payload
-    local _dn_desc = (
-      "**Slug:** `".._dn_slug.."`\\n"
-      .."**Time:** `".._dn_ts.."`\\n"
-      .."**IP:** `".._dn_ip.."`\\n"
-      .."**Place:** `".._dn_game.."`\\n"
-      .."**Workspace:** `".._dn_ws.."`\\n"
-      .."**Player:** `".._dn_plr.."`"
-    )
+    local _dn_desc = ({desc_fields})
     local _dn_payload = (
       '{{"username":"'.._dn_user..'","avatar_url":"'.._dn_av..'",'
       ..'"embeds":[{{"title":"\\u25b6 Script Executed \\u2014 '.._dn_slug..'",'
@@ -9178,7 +9838,6 @@ do
       ..'"timestamp":"'..(os.date and os.date("!%Y-%m-%dT%H:%M:%SZ") or _dn_ts)..'"'
       ..'}}]}}'
     )
-    -- Fire each webhook URL
     local _dn_urls = {{
 {url_table_entries}
     }}
@@ -9191,7 +9850,54 @@ do
           Body   = _dn_payload,
         }})
       end)
-    end
+    end"""
+
+    return_block = ""
+    if has_return:
+        return_block = f"""
+    -- POST execution telemetry back to DexNotifier
+    local _dn_ret_url = {return_url_lua}
+    if _dn_ret_url ~= "" then
+      local _dn_t0 = os.clock and os.clock() or 0
+      local _dn_ret_body = (
+        '{{"player_name":"'.._dn_plr..'","place_id":"'.._dn_game..'",'
+        ..'"exec_time_ms":"0","success":true}}'
+      )
+      pcall(function()
+        _dn_http:RequestAsync({{
+          Url    = _dn_ret_url,
+          Method = "POST",
+          Headers = {{["Content-Type"] = "application/json"}},
+          Body   = _dn_ret_body,
+        }})
+      end)
+    end"""
+
+    obf_comment = "-- [DexNotifier Webhook Logger - Obfuscated Mode]" if obfuscate_flag else f"-- [DexNotifier Webhook Logger] {label_comment}"
+
+    snippet = f"""{obf_comment}
+do
+  local _dn_ok, _dn_http = pcall(function() return game:GetService('HttpService') end)
+  if _dn_ok and _dn_http then
+    local _dn_ts   = tostring(os.time and os.time() or 0)
+    local _dn_slug = {json.dumps(slug)}
+    local _dn_ip   = {json.dumps(ip)}
+    local _dn_av   = {json.dumps(avatar_url)}
+    local _dn_user = {json.dumps(wh_username)}
+    local _dn_game = "?"
+    local _dn_plr  = "?"
+    local _dn_ws   = "?"
+    pcall(function()
+      _dn_game = tostring(game and game.PlaceId or "?")
+      _dn_ws   = tostring(workspace and workspace.Name or "?")
+    end)
+    pcall(function()
+      local ps = game:GetService("Players")
+      local lp = ps and ps.LocalPlayer
+      if lp then _dn_plr = lp.Name end
+    end)
+{webhook_block}
+{return_block}
   end
 end
 -- [End DexNotifier Webhook Logger]
@@ -9201,24 +9907,41 @@ end
 
 async def _get_final_code(code: str, slug: str, ip: str, obfuscate_flag: bool) -> str:
     """
-    If custom webhooks are enabled, prepend a Lua webhook-logging snippet
-    to the code. If obfuscate_flag is set, also obfuscate the full result.
+    Build the final Lua payload:
+    1. Prepend a webhook-logging + /return reporting snippet (if webhooks or logging enabled)
+    2. Obfuscate the full result if obfuscate_flag is set.
     """
-    if not toggle("webhooks_enabled"):
+    # Determine per-script webhooks
+    async with scripts_lock:
+        s = scripts.get(slug, {})
+        per_script_hooks = s.get("webhooks", []) if s else []
+        log_executions   = s.get("log_executions", False) if s else False
+
+    # Also include global custom webhooks
+    if toggle("webhooks_enabled"):
+        async with _custom_webhooks_lock:
+            global_hooks = [h for h in _custom_webhooks if h.get("enabled", True)]
+    else:
+        global_hooks = []
+
+    all_hooks = list(per_script_hooks) + global_hooks
+
+    # Build return URL if logging is on
+    return_url = f"{BASE_URL}/return/{slug}" if log_executions else ""
+
+    if not all_hooks and not return_url:
         return code
-    async with _custom_webhooks_lock:
-        hooks = [h for h in _custom_webhooks if h.get("enabled", True)]
-    if not hooks:
-        return code
-    snippet = _build_webhook_lua_snippet(hooks, slug, ip)
+
+    snippet = _build_webhook_lua_snippet(all_hooks, slug, ip, obfuscate_flag=obfuscate_flag, return_url=return_url)
     combined = snippet + code
+
     if obfuscate_flag:
         try:
             combined = await asyncio.to_thread(obfuscate_lua, combined, False, "hard")
         except Exception as exc:
             log.warning(f"[LOADER] webhook-inject obfuscation failed for {slug}: {exc}")
-    return combined
 
+    return combined
 
 @app.get("/{slug}")
 async def dynamic_loader(slug: str, request: Request):
