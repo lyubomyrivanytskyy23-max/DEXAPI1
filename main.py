@@ -13,8 +13,11 @@ import re
 import unicodedata
 import urllib.request
 import urllib.error
+import urllib.parse
+import logging
+import traceback
 from collections import defaultdict, deque
-from typing import Set, Dict, Any, Optional
+from typing import Set, Dict, Any, Optional, List
 from urllib.parse import parse_qs, urlencode
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -23,6 +26,252 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, Red
 import uvicorn
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STRUCTURED SERVER LOGGING
+# Writes timestamped entries to the console and (optionally) a rotating file.
+# Set DEX_LOG_LEVEL to DEBUG / INFO / WARNING / ERROR to control verbosity.
+# Set DEX_LOG_FILE to a path to also persist logs to disk (rotated at 10 MB).
+# ═════════════════════════════════════════════════════════════════════════════
+
+_LOG_LEVEL_NAME = os.environ.get("DEX_LOG_LEVEL", "INFO").strip().upper()
+_LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, logging.INFO)
+
+logging.basicConfig(
+    level=_LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("dexnotifier")
+
+_LOG_FILE = os.environ.get("DEX_LOG_FILE", "").strip()
+if _LOG_FILE:
+    try:
+        from logging.handlers import RotatingFileHandler as _RFH
+        _fh = _RFH(_LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        ))
+        log.addHandler(_fh)
+        log.info(f"[LOGGING] File logging enabled → {_LOG_FILE}")
+    except Exception as _log_err:
+        log.warning(f"[LOGGING] Could not enable file logging ({_log_err})")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EXECUTION LOG — per-script execution events with metadata
+# Stored in memory (capped) and flushed to disk. Separate from the raw /logs
+# endpoint so script owners can review who ran their script and when.
+# ═════════════════════════════════════════════════════════════════════════════
+
+MAX_EXEC_LOG_ENTRIES = 2000
+
+_exec_log: List[Dict[str, Any]] = []
+_exec_log_lock = asyncio.Lock()
+
+
+async def record_execution(
+    slug: str,
+    ip: str,
+    success: bool,
+    reason: str = "",
+    hwid: str = "",
+    key: str = "",
+) -> None:
+    """Record one script execution event. Called from dynamic_loader."""
+    entry: Dict[str, Any] = {
+        "slug":      slug,
+        "ip":        ip,
+        "timestamp": time.time(),
+        "ts_str":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "success":   success,
+        "reason":    reason,
+        "hwid":      hwid[:40] if hwid else "",
+        "key_hint":  (key[:4] + "…") if key else "",
+    }
+    async with _exec_log_lock:
+        _exec_log.append(entry)
+        if len(_exec_log) > MAX_EXEC_LOG_ENTRIES:
+            del _exec_log[: len(_exec_log) - MAX_EXEC_LOG_ENTRIES]
+
+    log.info(
+        f"[EXEC] slug={slug} ip={ip} ok={success}"
+        + (f" reason={reason}" if reason else "")
+    )
+
+    # Fire webhook asynchronously — do not await, so the loader is never slowed
+    asyncio.create_task(_fire_exec_webhooks(entry))
+
+
+async def _fire_exec_webhooks(entry: Dict[str, Any]) -> None:
+    """Send a JSON POST to every enabled execution webhook URL."""
+    urls = [
+        u for u in [
+            WEBHOOK_EXECUTION_URL,
+            WEBHOOK_SECONDARY_URL,
+        ]
+        if u
+    ]
+    if not urls:
+        return
+    payload = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+    for url in urls:
+        try:
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                log.debug(f"[WEBHOOK] exec → {url} status={resp.status}")
+        except Exception as exc:
+            log.warning(f"[WEBHOOK] exec delivery failed → {url}: {exc}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WEBHOOK CONFIG — set via env vars. All are optional; unset = disabled.
+#
+#  DEX_WEBHOOK_EXECUTION   POST every script run event (slug, ip, success, …)
+#  DEX_WEBHOOK_SECONDARY   Secondary endpoint receiving the same exec events
+#  DEX_WEBHOOK_ADMIN       POST admin-action events (announcement, ban, etc.)
+#  DEX_WEBHOOK_LOGS        POST each new /logs entry to an external sink
+#  DEX_WEBHOOK_REGISTER    POST each new user registration
+#  DEX_WEBHOOK_LOGIN       POST each successful login (username only)
+#  DEX_WEBHOOK_CHAT        POST each public Chat message
+#  DEX_WEBHOOK_BLACKLIST   POST blacklist add/remove events
+# ═════════════════════════════════════════════════════════════════════════════
+
+WEBHOOK_EXECUTION_URL   = os.environ.get("DEX_WEBHOOK_EXECUTION",  "").strip()
+WEBHOOK_SECONDARY_URL   = os.environ.get("DEX_WEBHOOK_SECONDARY",  "").strip()
+WEBHOOK_ADMIN_URL       = os.environ.get("DEX_WEBHOOK_ADMIN",      "").strip()
+WEBHOOK_LOGS_URL        = os.environ.get("DEX_WEBHOOK_LOGS",       "").strip()
+WEBHOOK_REGISTER_URL    = os.environ.get("DEX_WEBHOOK_REGISTER",   "").strip()
+WEBHOOK_LOGIN_URL       = os.environ.get("DEX_WEBHOOK_LOGIN",      "").strip()
+WEBHOOK_CHAT_URL        = os.environ.get("DEX_WEBHOOK_CHAT",       "").strip()
+WEBHOOK_BLACKLIST_URL   = os.environ.get("DEX_WEBHOOK_BLACKLIST",  "").strip()
+
+
+def _configured_webhooks() -> Dict[str, str]:
+    """Return {name: url} for every webhook that is currently set."""
+    return {k: v for k, v in {
+        "execution":  WEBHOOK_EXECUTION_URL,
+        "secondary":  WEBHOOK_SECONDARY_URL,
+        "admin":      WEBHOOK_ADMIN_URL,
+        "logs":       WEBHOOK_LOGS_URL,
+        "register":   WEBHOOK_REGISTER_URL,
+        "login":      WEBHOOK_LOGIN_URL,
+        "chat":       WEBHOOK_CHAT_URL,
+        "blacklist":  WEBHOOK_BLACKLIST_URL,
+    }.items() if v}
+
+
+async def _fire_webhook(url: str, payload: Dict[str, Any]) -> None:
+    """Generic fire-and-forget JSON POST to a single URL."""
+    if not url:
+        return
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "DexNotifier-Webhook/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            log.debug(f"[WEBHOOK] → {url} status={resp.status}")
+    except Exception as exc:
+        log.warning(f"[WEBHOOK] delivery failed → {url}: {exc}")
+
+
+def fire_webhook_bg(url: str, payload: Dict[str, Any]) -> None:
+    """Schedule a webhook POST without blocking the caller."""
+    if url:
+        asyncio.create_task(_fire_webhook(url, payload))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FEATURE TOGGLES — runtime on/off switches for server-side features.
+# Loaded from env vars on startup; can be toggled at runtime via /admin.
+# Persisted to TOGGLES_FILE so they survive restarts.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# (TOGGLES_FILE is defined later after DATA_DIR is resolved; see _init_toggles)
+
+_TOGGLE_DEFAULTS: Dict[str, bool] = {
+    # ── Execution & logging ──────────────────────────────────────────────────
+    "execution_logging":       True,   # record per-script run events to _exec_log
+    "log_broadcast":           True,   # forward /logs POSTs to WS viewers
+    "detailed_error_logging":  False,  # log full tracebacks server-side (verbose)
+    # ── Access control ───────────────────────────────────────────────────────
+    "script_serving":          True,   # global kill-switch for the /{slug} loader
+    "paid_key_validation":     True,   # if False, paid scripts serve without a key check
+    "hwid_enforcement":        True,   # if False, HWID binding is skipped even when configured
+    "blacklist_enforcement":   True,   # if False, blacklisted users can still receive scripts
+    # ── Rate-limiting ────────────────────────────────────────────────────────
+    "global_rate_limiting":    True,   # per-IP global HTTP budget (see GLOBAL_HTTP_RATE_*)
+    "slug_rate_limiting":      True,   # per-IP rate limit on /{slug} loader requests
+    # ── Chat ─────────────────────────────────────────────────────────────────
+    "chat_media_uploads":      True,   # allow photo/video in Chat and ME-Chat
+    "game_chat":               True,   # enable the /game-chat/* endpoints
+    # ── Webhooks ─────────────────────────────────────────────────────────────
+    "webhooks_enabled":        True,   # master switch — disabling suppresses all webhook POSTs
+    # ── Obfuscation ──────────────────────────────────────────────────────────
+    "obfuscation_history":     True,   # persist obfuscation submissions to disk
+    "obfuscation_public":      True,   # allow unauthenticated access to /obfuscate
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    "announcements_enabled":   True,   # show site-wide announcement banner
+    "maintenance_mode":        False,  # return 503 for all public endpoints
+}
+
+_toggles: Dict[str, bool] = dict(_TOGGLE_DEFAULTS)
+_toggles_lock = asyncio.Lock()
+_TOGGLES_FILE: str = ""  # filled in by _init_toggles() after DATA_DIR is set
+
+
+def _init_toggles(data_dir: str) -> None:
+    global _TOGGLES_FILE
+    _TOGGLES_FILE = os.path.join(data_dir, "feature_toggles.json")
+    _load_toggles_from_disk()
+
+
+def _load_toggles_from_disk() -> None:
+    if not _TOGGLES_FILE or not os.path.exists(_TOGGLES_FILE):
+        return
+    try:
+        with open(_TOGGLES_FILE, "r", encoding="utf-8") as f:
+            saved: Dict[str, Any] = json.load(f)
+        for k, v in saved.items():
+            if k in _TOGGLE_DEFAULTS:
+                _toggles[k] = bool(v)
+        log.debug(f"[TOGGLES] Loaded from {_TOGGLES_FILE}")
+    except Exception as exc:
+        log.warning(f"[TOGGLES] Could not load {_TOGGLES_FILE}: {exc}")
+
+
+def _save_toggles_to_disk() -> None:
+    if not _TOGGLES_FILE:
+        return
+    try:
+        tmp = _TOGGLES_FILE + ".tmp." + secrets.token_hex(4)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_toggles, f)
+        os.replace(tmp, _TOGGLES_FILE)
+    except Exception as exc:
+        log.warning(f"[TOGGLES] Could not save {_TOGGLES_FILE}: {exc}")
+
+
+def toggle(name: str) -> bool:
+    """Return the current value of a feature toggle (thread-safe read)."""
+    return _toggles.get(name, _TOGGLE_DEFAULTS.get(name, True))
+
+
+async def set_toggle(name: str, value: bool) -> bool:
+    """Set a toggle at runtime and persist. Returns False if name is unknown."""
+    if name not in _TOGGLE_DEFAULTS:
+        return False
+    async with _toggles_lock:
+        _toggles[name] = bool(value)
+        _save_toggles_to_disk()
+    log.info(f"[TOGGLES] {name} → {bool(value)}")
+    return True
 
 
 class AnnouncementHTMLMiddleware(BaseHTTPMiddleware):
@@ -1153,6 +1402,7 @@ def _resolve_data_dir() -> str:
 
 
 DATA_DIR = _resolve_data_dir()
+_init_toggles(DATA_DIR)  # load persisted feature toggles from disk
 _USING_FALLBACK_DATA_DIR = DATA_DIR != (os.environ.get("DEX_DATA_DIR", "/data").strip() or "/data")
 if _USING_FALLBACK_DATA_DIR:
     print(f"[DATA_DIR] *** WARNING: running WITHOUT persistent storage. Using ephemeral "
@@ -2289,9 +2539,17 @@ async def global_rate_limit_and_security_headers(request: Request, call_next):
     # by each bridge endpoint below.
     is_bridge_request = request.url.path.startswith("/bridge/")
 
-    if not is_bridge_request and rate_limited(
+    # Maintenance mode — block all public traffic when enabled
+    if toggle("maintenance_mode") and not request.url.path.startswith("/admin"):
+        return PlainTextResponse(
+            "-- DexNotifier is currently undergoing maintenance. Check back shortly.",
+            status_code=503,
+        )
+
+    if toggle("global_rate_limiting") and not is_bridge_request and rate_limited(
         ip, "global_http", max_requests=GLOBAL_HTTP_RATE_LIMIT, window_seconds=GLOBAL_HTTP_RATE_WINDOW
     ):
+        log.debug(f"[RATE_LIMIT] global_http ip={ip} path={request.url.path}")
         return PlainTextResponse("RATE_LIMITED", status_code=429)
 
     response = await call_next(request)
@@ -2599,16 +2857,26 @@ async def post_logs(request: Request):
             del stored_logs[0: len(stored_logs) - MAX_STORED_LOGS]
         append_log_to_file(msg)
 
-        dead = []
-        for v in list(viewers):
-            try:
-                await v.send_text(msg)
-            except Exception:
-                dead.append(v)
+        if toggle("log_broadcast"):
+            dead = []
+            for v in list(viewers):
+                try:
+                    await v.send_text(msg)
+                except Exception:
+                    dead.append(v)
+            for d in dead:
+                viewers.discard(d)
 
-        for d in dead:
-            viewers.discard(d)
+    # Fire logs webhook (non-blocking)
+    if toggle("webhooks_enabled") and WEBHOOK_LOGS_URL:
+        fire_webhook_bg(WEBHOOK_LOGS_URL, {
+            "event":     "log",
+            "message":   msg,
+            "ip":        ip,
+            "timestamp": time.time(),
+        })
 
+    log.debug(f"[LOGS] POST ip={ip} msg_len={len(msg)}")
     return PlainTextResponse("OK")
 
 
@@ -2784,6 +3052,14 @@ async def add_blacklisted(request: Request):
         if username not in blacklisted_usernames:
             blacklisted_usernames.add(username)
             save_blacklist_to_file(blacklisted_usernames)
+            log.info(f"[BLACKLIST] add username={username} ip={ip}")
+            if toggle("webhooks_enabled") and WEBHOOK_BLACKLIST_URL:
+                fire_webhook_bg(WEBHOOK_BLACKLIST_URL, {
+                    "event":     "blacklist_add",
+                    "username":  username,
+                    "ip":        ip,
+                    "timestamp": time.time(),
+                })
 
     return PlainTextResponse("OK")
 
@@ -2814,6 +3090,14 @@ async def remove_blacklisted(request: Request):
         if username in blacklisted_usernames:
             blacklisted_usernames.discard(username)
             save_blacklist_to_file(blacklisted_usernames)
+            log.info(f"[BLACKLIST] remove username={username} ip={ip}")
+            if toggle("webhooks_enabled") and WEBHOOK_BLACKLIST_URL:
+                fire_webhook_bg(WEBHOOK_BLACKLIST_URL, {
+                    "event":     "blacklist_remove",
+                    "username":  username,
+                    "ip":        ip,
+                    "timestamp": time.time(),
+                })
 
     return PlainTextResponse("OK")
 
@@ -3149,6 +3433,7 @@ a{{color:inherit;text-decoration:none}}
   <p>Protect your Lua source, serve loader endpoints, and manage scripts — all in one place.</p>
   <div class="hero-actions">
     <a class="btn-primary" href="/obfuscate">Open Obfustucate</a>
+    <a class="btn-secondary" href="/home">Dashboard</a>
     <a class="btn-secondary" href="/scripts">Browse scripts</a>
     <a class="btn-secondary" href="/chat">Chat</a>
   </div>
@@ -3172,9 +3457,9 @@ a{{color:inherit;text-decoration:none}}
 </div>
 <div class="quicklinks">
   <a class="ql" href="/obfuscate"><strong>Obfustucate</strong><span>Protect Lua source</span><span class="ql-arrow">→</span></a>
-  <a class="ql" href="/chat"><strong>Chat</strong><span>Community chat</span><span class="ql-arrow">→</span></a>
-  <a class="ql" href="/scripts"><strong>Scripts</strong><span>Public loader catalog</span><span class="ql-arrow">→</span></a>
   <a class="ql" href="/home"><strong>Dashboard</strong><span>Manage your scripts</span><span class="ql-arrow">→</span></a>
+  <a class="ql" href="/scripts"><strong>Scripts</strong><span>Public loader catalog</span><span class="ql-arrow">→</span></a>
+  <a class="ql" href="/chat"><strong>Chat</strong><span>Community chat</span><span class="ql-arrow">→</span></a>
 </div>
 </body>
 </html>"""
@@ -3514,19 +3799,27 @@ def build_home_logged_in_body(username: str, message: str = "", success: str = "
         slug = s["slug"]
         name = s["name"]
         code = html.escape(s.get("code", ""))
-        is_paid = s.get("is_paid", False)
-        hwid_lock = s.get("hwid_lock", False)
+        is_paid            = s.get("is_paid", False)
+        hwid_lock          = s.get("hwid_lock", False)
+        obfuscate_flag     = s.get("obfuscate", False)
+        script_enabled     = s.get("script_enabled", True)
+        rate_limit_enabled = s.get("rate_limit_enabled", False)
+        log_executions     = s.get("log_executions", False)
         last_key = s.get("last_key", "")
         last_loadstring = s.get("last_loadstring", "")
         paid_text = "Paid" if is_paid else "Free"
-        hwid_text = "HWID Locked" if hwid_lock else "HWID Unlocked"
+        hwid_text = "HWID Locked" if hwid_lock else "No HWID"
         endpoint = f"{BASE_URL}/{slug}"
         cards_html += f"""
         <div class="card">
             <h2>{html.escape(name)} ({html.escape(slug)})</h2>
-            <p class="label">
+            <p class="label" style="display:flex;flex-wrap:wrap;gap:5px;align-items:center;">
                 <span class="pill {'red' if is_paid else 'green'}">{paid_text}</span>
-                <span class="pill {'purple' if hwid_lock else ''}">{hwid_text}</span>
+                {'<span class="pill purple">HWID Lock</span>' if hwid_lock else ''}
+                {'<span class="pill" style="color:#22d3ee;border-color:#0d2a2e;background:#030e10">Obfuscated</span>' if obfuscate_flag else ''}
+                {'<span class="pill green">Enabled</span>' if script_enabled else '<span class="pill red">Disabled</span>'}
+                {'<span class="pill red">Rate Limit</span>' if rate_limit_enabled else ''}
+                {'<span class="pill" style="color:#f59e0b;border-color:#3a2000;background:#1a0e00">Log Execs</span>' if log_executions else ''}
             </p>
             <p class="small-text">Endpoint: <code>{html.escape(endpoint)}</code></p>
             <p class="small-text">Executor loadstring:</p>
@@ -3545,11 +3838,41 @@ loadstring(game:HttpGet("{html.escape(endpoint)}"))()
                 <input type="text" name="name" value="{html.escape(name)}" maxlength="48">
                 <label class="label">Script Code (Lua)</label>
                 <textarea name="code">{code}</textarea>
-                <label class="label">Paid?</label>
-                <input type="text" name="is_paid" placeholder="yes/no" value="{ 'yes' if is_paid else 'no' }">
-                <label class="label">HWID Lock?</label>
-                <input type="text" name="hwid_lock" placeholder="yes/no" value="{ 'yes' if hwid_lock else 'no' }">
-                <button type="submit">Save Changes</button>
+                <label class="label" style="margin-top:14px;">Options</label>
+                <div class="tog-row">
+                    <label class="tog obf">
+                        <input type="checkbox" name="obfuscate" {'checked' if s.get('obfuscate') else ''}>
+                        <span class="tog-track"></span>
+                        <span class="tog-label">Obfuscate</span>
+                    </label>
+                    <label class="tog paid">
+                        <input type="checkbox" name="is_paid" {'checked' if is_paid else ''}>
+                        <span class="tog-track"></span>
+                        <span class="tog-label">Paid</span>
+                    </label>
+                    <label class="tog hwid">
+                        <input type="checkbox" name="hwid_lock" {'checked' if hwid_lock else ''}>
+                        <span class="tog-track"></span>
+                        <span class="tog-label">HWID Lock</span>
+                    </label>
+
+                    <label class="tog">
+                        <input type="checkbox" name="script_enabled" {'checked' if s.get('script_enabled', True) else ''}>
+                        <span class="tog-track"></span>
+                        <span class="tog-label">Enabled</span>
+                    </label>
+                    <label class="tog danger">
+                        <input type="checkbox" name="rate_limit_enabled" {'checked' if s.get('rate_limit_enabled') else ''}>
+                        <span class="tog-track"></span>
+                        <span class="tog-label">Rate Limit</span>
+                    </label>
+                    <label class="tog danger">
+                        <input type="checkbox" name="log_executions" {'checked' if s.get('log_executions') else ''}>
+                        <span class="tog-track"></span>
+                        <span class="tog-label">Log Execs</span>
+                    </label>
+                </div>
+                <button type="submit" style="margin-top:14px;">Save Changes</button>
             </form>
             <p class="small-text" style="margin-top:10px;">Generate paid key for this script:</p>
             <form method="post" action="/home">
@@ -3577,6 +3900,35 @@ loadstring(game:HttpGet("{html.escape(endpoint)}"))()
         """
 
     body = f"""
+    <style>
+    /* ── Toggle switch ── */
+    .tog-row{{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0 4px}}
+    .tog{{display:flex;flex-direction:column;align-items:center;gap:5px;cursor:pointer;user-select:none;min-width:80px}}
+    .tog input{{display:none}}
+    .tog-track{{width:44px;height:24px;border-radius:999px;background:#222;border:1px solid #2a2a2a;position:relative;transition:background .2s,border-color .2s}}
+    .tog-track:after{{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#555;transition:transform .2s,background .2s}}
+    .tog input:checked+.tog-track{{background:#1a3a1a;border-color:#2a5a2a}}
+    .tog input:checked+.tog-track:after{{transform:translateX(20px);background:#4ade80}}
+    .tog-label{{font-size:11px;color:#555;font-weight:600;letter-spacing:.04em;text-transform:uppercase;text-align:center;transition:color .2s}}
+    .tog input:checked~.tog-label{{color:#4ade80}}
+    /* paid toggle variant */
+    .tog.paid input:checked+.tog-track{{background:#2a1a00;border-color:#5a3a00}}
+    .tog.paid input:checked+.tog-track:after{{background:#f59e0b}}
+    .tog.paid input:checked~.tog-label{{color:#f59e0b}}
+    /* hwid toggle variant */
+    .tog.hwid input:checked+.tog-track{{background:#1a1a3a;border-color:#2a2a6a}}
+    .tog.hwid input:checked+.tog-track:after{{background:#a78bfa}}
+    .tog.hwid input:checked~.tog-label{{color:#a78bfa}}
+    /* danger toggle variant */
+    .tog.danger input:checked+.tog-track{{background:#2a0a0a;border-color:#5a1a1a}}
+    .tog.danger input:checked+.tog-track:after{{background:#f87171}}
+    .tog.danger input:checked~.tog-label{{color:#f87171}}
+    /* obf toggle variant */
+    .tog.obf input:checked+.tog-track{{background:#0d1a2a;border-color:#1a3a5a}}
+    .tog.obf input:checked+.tog-track:after{{background:#22d3ee}}
+    .tog.obf input:checked~.tog-label{{color:#22d3ee}}
+    </style>
+
     <div class="card">
         <h1>Dex Home - Script Manager</h1>
         <p class="label">
@@ -3593,20 +3945,58 @@ loadstring(game:HttpGet("{html.escape(endpoint)}"))()
 
     <div class="card">
         <h2>Create New Script</h2>
-        <p class="label">Name determines endpoint. Spaces become dashes. Example: "Dex 2" -> /Dex-2</p>
+        <p class="label">Name determines endpoint. Spaces become dashes. Example: "Dex 2" → /Dex-2</p>
         <form method="post" action="/home">
             <input type="hidden" name="action" value="create_script">
             <label class="label">Script Name</label>
             <input type="text" name="name" placeholder="e.g. Dexnew, Dex 2" maxlength="48">
             <label class="label">Script Code (Lua)</label>
             <textarea name="code" placeholder="Paste your Lua script here"></textarea>
-            <label class="label">Paid? (yes/no)</label>
-            <input type="text" name="is_paid" placeholder="yes or no">
-            <label class="label">HWID Lock? (yes/no)</label>
-            <input type="text" name="hwid_lock" placeholder="yes or no">
-            <button type="submit">Add Script</button>
+            <label class="label" style="margin-top:14px;">Options</label>
+            <div class="tog-row">
+                <label class="tog obf">
+                    <input type="checkbox" name="obfuscate">
+                    <span class="tog-track"></span>
+                    <span class="tog-label">Obfuscate</span>
+                </label>
+                <label class="tog paid">
+                    <input type="checkbox" name="is_paid">
+                    <span class="tog-track"></span>
+                    <span class="tog-label">Paid</span>
+                </label>
+                <label class="tog hwid">
+                    <input type="checkbox" name="hwid_lock">
+                    <span class="tog-track"></span>
+                    <span class="tog-label">HWID Lock</span>
+                </label>
+
+                <label class="tog">
+                    <input type="checkbox" name="script_enabled" checked>
+                    <span class="tog-track"></span>
+                    <span class="tog-label">Enabled</span>
+                </label>
+                <label class="tog danger">
+                    <input type="checkbox" name="rate_limit_enabled">
+                    <span class="tog-track"></span>
+                    <span class="tog-label">Rate Limit</span>
+                </label>
+                <label class="tog danger">
+                    <input type="checkbox" name="log_executions">
+                    <span class="tog-track"></span>
+                    <span class="tog-label">Log Execs</span>
+                </label>
+            </div>
+            <p class="small-text" style="margin-top:6px;font-size:11px;">
+                <b style="color:#22d3ee">Obfuscate</b>: auto-protect code on save &nbsp;|&nbsp;
+                <b style="color:#f59e0b">Paid</b>: require a key &nbsp;|&nbsp;
+                <b style="color:#a78bfa">HWID Lock</b>: bind to hardware &nbsp;|&nbsp;
+                <b style="color:#4ade80">Enabled</b>: script active &nbsp;|&nbsp;
+                <b style="color:#f87171">Rate Limit</b>: throttle requests &nbsp;|&nbsp;
+                <b style="color:#f87171">Log Execs</b>: track executions
+            </p>
+            <button type="submit" style="margin-top:14px;">Add Script</button>
         </form>
-        <p class="small-text" style="margin-top:10px;">After creation, you will see your script below with loadstring and controls.</p>
+        <p class="small-text" style="margin-top:10px;">After creation, your script appears below with its loadstring and controls.</p>
     </div>
 
     <div class="grid">
@@ -3976,6 +4366,14 @@ async def home_post(request: Request):
             }
             save_users_to_file()
         await clear_attempts("home_register", ip)
+        log.info(f"[AUTH] register username={username} ip={ip}")
+        if toggle("webhooks_enabled") and WEBHOOK_REGISTER_URL:
+            fire_webhook_bg(WEBHOOK_REGISTER_URL, {
+                "event":     "register",
+                "username":  username,
+                "ip":        ip,
+                "timestamp": time.time(),
+            })
         resp = HTMLResponse(HOME_BASE_HTML.format(
             body=build_home_logged_in_body(username, success="Account created and logged in.")))
         set_session_cookie(resp, username)
@@ -3994,6 +4392,14 @@ async def home_post(request: Request):
                 body=build_home_logged_out_body("Invalid username or password.")))
 
         await clear_attempts("home_login", ip)
+        log.info(f"[AUTH] login username={username} ip={ip}")
+        if toggle("webhooks_enabled") and WEBHOOK_LOGIN_URL:
+            fire_webhook_bg(WEBHOOK_LOGIN_URL, {
+                "event":     "login",
+                "username":  username,
+                "ip":        ip,
+                "timestamp": time.time(),
+            })
         resp = HTMLResponse(HOME_BASE_HTML.format(
             body=build_home_logged_in_body(username, success="Logged in.")))
         set_session_cookie(resp, username)
@@ -4012,8 +4418,13 @@ async def home_post(request: Request):
     if action == "create_script":
         name = data.get("name", [""])[0].strip()
         code = data.get("code", [""])[0]
-        is_paid_str = data.get("is_paid", ["no"])[0].strip().lower()
-        hwid_lock_str = data.get("hwid_lock", ["no"])[0].strip().lower()
+        # Toggles: checkboxes — present in POST data means "on", absent means "off"
+        is_paid           = "is_paid"           in data
+        hwid_lock         = "hwid_lock"         in data
+        obfuscate         = "obfuscate"         in data
+        script_enabled    = "script_enabled"    in data
+        rate_limit_enabled= "rate_limit_enabled"in data
+        log_executions    = "log_executions"    in data
 
         if not name or not code:
             return HTMLResponse(HOME_BASE_HTML.format(
@@ -4021,6 +4432,13 @@ async def home_post(request: Request):
         if len(code.encode("utf-8")) > MAX_SCRIPT_BODY:
             return HTMLResponse(HOME_BASE_HTML.format(
                 body=build_home_logged_in_body(current_user, message="Script code is too large.")))
+
+        # If Obfuscate toggle is on, protect the code now
+        if obfuscate:
+            try:
+                code = obfuscate_lua(code)
+            except Exception:
+                pass  # fall back to raw code if obfuscation fails
 
         slug = make_slug(name)
         if not slug or slug.lower() in RESERVED_PATHS_LOWER:
@@ -4035,8 +4453,12 @@ async def home_post(request: Request):
                 "name": name,
                 "slug": slug,
                 "code": code,
-                "is_paid": is_paid_str == "yes",
-                "hwid_lock": hwid_lock_str == "yes",
+                "is_paid":            is_paid,
+                "hwid_lock":          hwid_lock,
+                "obfuscate":          obfuscate,
+                "script_enabled":     script_enabled,
+                "rate_limit_enabled": rate_limit_enabled,
+                "log_executions":     log_executions,
                 "owner": current_user,
                 "created_at": time.time(),
                 "updated_at": time.time(),
@@ -4052,8 +4474,13 @@ async def home_post(request: Request):
         slug = data.get("slug", [""])[0].strip()
         name = data.get("name", [""])[0].strip()
         code = data.get("code", [""])[0]
-        is_paid_str = data.get("is_paid", ["no"])[0].strip().lower()
-        hwid_lock_str = data.get("hwid_lock", ["no"])[0].strip().lower()
+        # Toggles: checkboxes — present in POST data means "on", absent means "off"
+        is_paid            = "is_paid"            in data
+        hwid_lock          = "hwid_lock"          in data
+        obfuscate          = "obfuscate"          in data
+        script_enabled     = "script_enabled"     in data
+        rate_limit_enabled = "rate_limit_enabled" in data
+        log_executions     = "log_executions"     in data
 
         async with scripts_lock:
             s = scripts.get(slug)
@@ -4068,11 +4495,21 @@ async def home_post(request: Request):
             if len(code.encode("utf-8")) > MAX_SCRIPT_BODY:
                 return HTMLResponse(HOME_BASE_HTML.format(
                     body=build_home_logged_in_body(current_user, message="Script code is too large.")))
-            s["name"] = name or s["name"]
-            s["code"] = code
-            s["is_paid"] = is_paid_str == "yes"
-            s["hwid_lock"] = hwid_lock_str == "yes"
-            s["updated_at"] = time.time()
+            # If Obfuscate toggle is on, protect the code now
+            if obfuscate:
+                try:
+                    code = obfuscate_lua(code)
+                except Exception:
+                    pass
+            s["name"]               = name or s["name"]
+            s["code"]               = code
+            s["is_paid"]            = is_paid
+            s["hwid_lock"]          = hwid_lock
+            s["obfuscate"]          = obfuscate
+            s["script_enabled"]     = script_enabled
+            s["rate_limit_enabled"] = rate_limit_enabled
+            s["log_executions"]     = log_executions
+            s["updated_at"]         = time.time()
             save_scripts_to_file()
         return HTMLResponse(HOME_BASE_HTML.format(
             body=build_home_logged_in_body(current_user, success="Script updated.")))
@@ -4837,6 +5274,7 @@ async def build_admin_dashboard_body() -> str:
             <li><button data-tab="scripts"><span class="dn-nav-icon">&#9636;</span>Scripts &amp; Loaders</button></li>
             <li><button data-tab="users"><span class="dn-nav-icon">&#9786;</span>Users &amp; Keys</button></li>
             <li><button data-tab="obf"><span class="dn-nav-icon">&#9670;</span>Obfustucate</button></li>
+            <li><button data-tab="toggles"><span class="dn-nav-icon">&#9881;</span>Toggles &amp; Logs</button></li>
             <li><button class="danger-tab" data-tab="danger"><span class="dn-nav-icon">&#9888;</span>Danger Zone</button></li>
         </ul>
         <div class="dn-sidebar-foot">Signed in with the Railway admin session.<br><a href="/admin/logout">Log out &rarr;</a></div>
@@ -5026,7 +5464,198 @@ async def build_admin_dashboard_body() -> str:
                 <div class="meta"><strong>Wipe all chat history</strong><span>Deletes every stored message in both Chat and ME-Chat, and clears it live for anyone currently connected. Room on/off switches and media files are unaffected.</span></div>
                 <button type="button" class="danger-btn" id="danger-clear-all">Clear all messages</button>
             </div>
+            <div class="dn-switch-row" style="margin-top:14px;">
+                <div class="meta"><strong>Clear execution log</strong><span>Wipes all in-memory script execution events. Does not affect script code or keys.</span></div>
+                <button type="button" class="danger-btn" id="danger-clear-exec-log">Clear exec log</button>
+            </div>
         </div>
+    </section>
+    """
+
+    # ── Feature Toggles tab ──────────────────────────────────────────────
+    _toggle_rows = ""
+    _toggle_descriptions = {
+        "execution_logging":      "Record every script run event (ip, slug, success, reason) to the execution log.",
+        "log_broadcast":          "Broadcast /logs POST messages to WebSocket viewers in real-time.",
+        "detailed_error_logging": "Log full Python tracebacks server-side (verbose — only enable for debugging).",
+        "script_serving":         "Master switch — turn off to stop ALL /{slug} loader requests site-wide.",
+        "paid_key_validation":    "Enforce paid key checks. Disable to let paid scripts serve without a key (DANGER).",
+        "hwid_enforcement":       "Enforce HWID binding on keys that have it. Disable to bypass HWID checks.",
+        "blacklist_enforcement":  "Block blacklisted usernames from receiving scripts.",
+        "global_rate_limiting":   "Enforce the per-IP global HTTP request budget across all endpoints.",
+        "slug_rate_limiting":     "Enforce the per-IP rate limit on /{slug} loader requests specifically.",
+        "chat_media_uploads":     "Allow photo and video uploads in Chat and ME-Chat.",
+        "game_chat":              "Enable the /game-chat/* endpoints (Roblox in-game chat bridge).",
+        "webhooks_enabled":       "Master webhook switch — disable to suppress ALL outgoing webhook POSTs.",
+        "obfuscation_history":    "Persist each /obfuscate submission to disk for the admin history viewer.",
+        "obfuscation_public":     "Allow unauthenticated access to the /obfuscate endpoint.",
+        "announcements_enabled":  "Show the site-wide announcement banner on all HTML pages.",
+        "maintenance_mode":       "Return 503 for all public endpoints — admin panel still accessible.",
+    }
+    _danger_toggles = {"script_serving", "paid_key_validation", "hwid_enforcement", "maintenance_mode", "global_rate_limiting"}
+    for _name, _default in _TOGGLE_DEFAULTS.items():
+        _cur  = toggle(_name)
+        _desc = _toggle_descriptions.get(_name, "")
+        _is_danger = _name in _danger_toggles
+        _color = "color:#f87171" if _is_danger and _cur != _default else ""
+        _toggle_rows += f"""
+        <div class="dn-switch-row" style="padding:10px 0;border-bottom:1px solid #1a1a1a;">
+            <div class="meta">
+                <strong style="{_color}">{html.escape(_name)}</strong>
+                <span>{html.escape(_desc)}</span>
+                <span style="font-size:10px;color:#555;">default: {"on" if _default else "off"}</span>
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                <input type="checkbox" class="toggle-checkbox" data-toggle="{html.escape(_name)}"
+                    {"checked" if _cur else ""}
+                    style="width:18px;height:18px;cursor:pointer;accent-color:#4ade80;">
+                <span class="toggle-status-label" style="font-size:12px;color:{'#4ade80' if _cur else '#888'};">
+                    {"ON" if _cur else "OFF"}
+                </span>
+            </label>
+        </div>"""
+
+    tab_toggles = f"""
+    <section class="tab-panel" id="tab-toggles">
+        <div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+                <div>
+                    <h2 style="margin:0;">Feature Toggles</h2>
+                    <p class="small-text" style="margin:4px 0 0;">
+                        All toggles take effect immediately and are persisted to disk.
+                        Changes survive restarts.
+                    </p>
+                </div>
+                <div style="display:flex;gap:8px;">
+                    <button type="button" id="toggles-reset-btn" style="background:#1a0a0a;color:#f87171;border-color:#3a1a1a;font-size:12px;padding:6px 12px;">
+                        Reset all to defaults
+                    </button>
+                    <button type="button" id="toggles-webhook-test-btn" style="font-size:12px;padding:6px 12px;">
+                        Test webhooks
+                    </button>
+                </div>
+            </div>
+            <div id="toggles-status" class="small-text" style="margin-bottom:12px;min-height:16px;"></div>
+            <div id="toggles-list">
+                {_toggle_rows}
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+            <h2>Execution Log</h2>
+            <p class="small-text">Last <span id="exec-log-count">—</span> runs recorded in memory (cap {MAX_EXEC_LOG_ENTRIES}). Toggle <code>execution_logging</code> above to enable/disable recording.</p>
+            <div style="display:flex;gap:8px;margin:10px 0;">
+                <input type="text" id="exec-log-slug-filter" placeholder="Filter by slug…" style="flex:1;max-width:240px;">
+                <button type="button" id="exec-log-refresh-btn" style="font-size:12px;padding:6px 12px;">Refresh</button>
+                <button type="button" id="exec-log-clear-btn" style="font-size:12px;padding:6px 12px;background:#1a0a0a;color:#f87171;border-color:#3a1a1a;">Clear</button>
+            </div>
+            <div id="exec-log-box" class="logs-box" style="max-height:400px;overflow:auto;font-size:11px;font-family:monospace;">Loading…</div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+            <h2>Webhook Status</h2>
+            <p class="small-text">Configured webhook endpoints. Set via environment variables (DEX_WEBHOOK_*).</p>
+            <div id="webhook-status-box" class="logs-box" style="font-size:12px;font-family:monospace;">Loading…</div>
+        </div>
+
+        <script>
+        (() => {{
+            // ── Toggle checkboxes ─────────────────────────────────────────
+            const statusEl = document.getElementById('toggles-status');
+            function setStatus(msg, ok) {{
+                statusEl.textContent = msg;
+                statusEl.style.color = ok ? '#4ade80' : '#f87171';
+                setTimeout(() => {{ if (statusEl.textContent === msg) statusEl.textContent = ''; }}, 3000);
+            }}
+
+            document.querySelectorAll('.toggle-checkbox').forEach(cb => {{
+                cb.addEventListener('change', async () => {{
+                    const name = cb.dataset.toggle;
+                    const enabled = cb.checked;
+                    const label = cb.nextElementSibling;
+                    try {{
+                        const r = await fetch(`/admin/toggles/${{encodeURIComponent(name)}}`, {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify({{enabled}}),
+                            credentials: 'same-origin',
+                        }});
+                        const d = await r.json();
+                        if (!r.ok) {{ setStatus(d.error || 'Error', false); cb.checked = !enabled; return; }}
+                        label.textContent = enabled ? 'ON' : 'OFF';
+                        label.style.color = enabled ? '#4ade80' : '#888';
+                        setStatus(`${{name}} → ${{enabled ? 'ON' : 'OFF'}}`, true);
+                    }} catch (e) {{ setStatus('Network error', false); cb.checked = !enabled; }}
+                }});
+            }});
+
+            // ── Reset all ─────────────────────────────────────────────────
+            document.getElementById('toggles-reset-btn').addEventListener('click', async () => {{
+                if (!confirm('Reset ALL toggles to compiled defaults?')) return;
+                const r = await fetch('/admin/toggles/reset', {{method:'POST', credentials:'same-origin'}});
+                if (r.ok) {{ location.reload(); }} else {{ setStatus('Reset failed', false); }}
+            }});
+
+            // ── Webhook test ──────────────────────────────────────────────
+            document.getElementById('toggles-webhook-test-btn').addEventListener('click', async () => {{
+                const r = await fetch('/admin/webhooks/test', {{method:'POST', credentials:'same-origin'}});
+                const d = await r.json().catch(() => ({{}}));
+                setStatus(r.ok ? `Test sent to: ${{(d.fired||[]).join(', ')||'(none)'}}` : (d.error||'Error'), r.ok);
+            }});
+
+            // ── Exec log ──────────────────────────────────────────────────
+            async function loadExecLog() {{
+                const slug = document.getElementById('exec-log-slug-filter').value.trim();
+                const url  = '/admin/exec-log?limit=200' + (slug ? '&slug=' + encodeURIComponent(slug) : '');
+                const box  = document.getElementById('exec-log-box');
+                const cnt  = document.getElementById('exec-log-count');
+                box.textContent = 'Loading…';
+                try {{
+                    const r = await fetch(url, {{credentials:'same-origin', cache:'no-store'}});
+                    const d = await r.json();
+                    if (!r.ok) {{ box.textContent = d.error || 'Error'; return; }}
+                    cnt.textContent = d.total;
+                    if (!d.entries.length) {{ box.textContent = 'No entries.'; return; }}
+                    box.innerHTML = d.entries.map(e => {{
+                        const ts = new Date(e.timestamp * 1000).toLocaleTimeString();
+                        const ok = e.success ? '<span style="color:#4ade80">✓</span>' : '<span style="color:#f87171">✗</span>';
+                        return `<div style="padding:3px 0;border-bottom:1px solid #1a1a1a;">
+                            ${{ok}} <strong>${{e.ts_str||ts}}</strong>
+                            slug=<span style="color:#79c0ff">${{e.slug}}</span>
+                            ip=<span style="color:#888">${{e.ip}}</span>
+                            reason=<em>${{e.reason||'ok'}}</em>
+                            ${{e.hwid ? 'hwid=' + e.hwid : ''}}
+                            ${{e.key_hint ? 'key=' + e.key_hint : ''}}
+                        </div>`;
+                    }}).join('');
+                }} catch {{ box.textContent = 'Error loading execution log.'; }}
+            }}
+            document.getElementById('exec-log-refresh-btn').addEventListener('click', loadExecLog);
+            document.getElementById('exec-log-slug-filter').addEventListener('keydown', e => e.key === 'Enter' && loadExecLog());
+            document.getElementById('exec-log-clear-btn').addEventListener('click', async () => {{
+                if (!confirm('Clear all execution log entries?')) return;
+                const r = await fetch('/admin/exec-log/clear', {{method:'POST', credentials:'same-origin'}});
+                if (r.ok) loadExecLog();
+            }});
+
+            // ── Webhook status ────────────────────────────────────────────
+            async function loadWebhookStatus() {{
+                const box = document.getElementById('webhook-status-box');
+                try {{
+                    const r = await fetch('/admin/webhooks', {{credentials:'same-origin', cache:'no-store'}});
+                    const d = await r.json();
+                    const master = d.master_enabled ? '<span style="color:#4ade80">enabled</span>' : '<span style="color:#f87171">disabled (master switch is off)</span>';
+                    const lines = Object.entries(d.urls||{{}}).map(([k,v]) =>
+                        `${{k.padEnd(12,' ')}}: ${{v ? '<span style="color:#4ade80">' + v + '</span>' : '<span style="color:#555">not set</span>'}}`
+                    ).join('\n');
+                    box.innerHTML = `<div>Master: ${{master}}</div><pre style="margin:8px 0 0;">${{lines}}</pre>`;
+                }} catch {{ box.textContent = 'Error loading webhook status.'; }}
+            }}
+
+            loadExecLog();
+            loadWebhookStatus();
+        }})();
+        </script>
     </section>
     """
 
@@ -5040,6 +5669,7 @@ async def build_admin_dashboard_body() -> str:
         + tab_scripts
         + tab_users
         + tab_obf
+        + tab_toggles
         + tab_danger
         + "</main>"
     )
@@ -5352,6 +5982,193 @@ async def admin_stats(request: Request):
         },
         headers={"Cache-Control": "no-store"},
     )
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ADMIN — EXECUTION LOG ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+EXEC_LOG_STATS_RATE_LIMIT = 20
+EXEC_LOG_STATS_RATE_WINDOW = 10.0
+
+
+@app.get("/admin/exec-log")
+async def admin_exec_log(request: Request):
+    """Return the most recent execution log entries (newest first)."""
+    ip = _client_ip(request)
+    if rate_limited(ip, "admin_exec_log", EXEC_LOG_STATS_RATE_LIMIT, EXEC_LOG_STATS_RATE_WINDOW):
+        return JSONResponse({"error": "rate limited"}, status_code=429)
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    slug_filter = request.query_params.get("slug", "").strip()
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit", "100"))))
+    except ValueError:
+        limit = 100
+
+    async with _exec_log_lock:
+        entries = list(reversed(_exec_log))
+
+    if slug_filter:
+        entries = [e for e in entries if e.get("slug") == slug_filter]
+
+    entries = entries[:limit]
+    return JSONResponse(
+        {
+            "ok":     True,
+            "count":  len(entries),
+            "total":  len(_exec_log),
+            "toggle": toggle("execution_logging"),
+            "entries": entries,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/admin/exec-log/clear")
+async def admin_exec_log_clear(request: Request):
+    """Wipe the in-memory execution log."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    async with _exec_log_lock:
+        removed = len(_exec_log)
+        _exec_log.clear()
+    log.info(f"[ADMIN] exec_log cleared ({removed} entries)")
+    if toggle("webhooks_enabled") and WEBHOOK_ADMIN_URL:
+        fire_webhook_bg(WEBHOOK_ADMIN_URL, {
+            "event":   "exec_log_cleared",
+            "removed": removed,
+            "timestamp": time.time(),
+        })
+    return JSONResponse({"ok": True, "removed": removed})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ADMIN — FEATURE TOGGLE ENDPOINTS
+# GET  /admin/toggles         → current state of all toggles
+# POST /admin/toggles/{name}  → {"enabled": true/false}
+# POST /admin/toggles/reset   → restore all to defaults
+# ═════════════════════════════════════════════════════════════════════════════
+
+TOGGLE_RATE_LIMIT  = 30
+TOGGLE_RATE_WINDOW = 10.0
+
+
+@app.get("/admin/toggles")
+async def admin_get_toggles(request: Request):
+    ip = _client_ip(request)
+    if rate_limited(ip, "admin_toggles_get", TOGGLE_RATE_LIMIT, TOGGLE_RATE_WINDOW):
+        return JSONResponse({"error": "rate limited"}, status_code=429)
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    async with _toggles_lock:
+        current = dict(_toggles)
+    return JSONResponse({
+        "ok":       True,
+        "toggles":  current,
+        "defaults": _TOGGLE_DEFAULTS,
+        "webhooks": _configured_webhooks(),
+    }, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/admin/toggles/{name}")
+async def admin_set_toggle(name: str, request: Request):
+    ip = _client_ip(request)
+    if rate_limited(ip, "admin_toggles_set", TOGGLE_RATE_LIMIT, TOGGLE_RATE_WINDOW):
+        return JSONResponse({"error": "rate limited"}, status_code=429)
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if name not in _TOGGLE_DEFAULTS:
+        return JSONResponse({"error": f"unknown toggle: {name}"}, status_code=400)
+
+    if reject_if_oversized(request, MAX_GENERIC_BODY):
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+    raw = await request.body()
+    if len(raw) > MAX_GENERIC_BODY:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+
+    # Accept both JSON {"enabled": true} and form-encoded enabled=1/true/on/yes
+    enabled: Optional[bool] = None
+    try:
+        body = json.loads(raw.decode(errors="ignore"))
+        if "enabled" in body:
+            enabled = bool(body["enabled"])
+    except Exception:
+        pass
+    if enabled is None:
+        form = parse_qs(raw.decode(errors="ignore"))
+        val = form.get("enabled", [""])[0].strip().lower()
+        if val in {"1", "true", "on", "yes"}:
+            enabled = True
+        elif val in {"0", "false", "off", "no"}:
+            enabled = False
+    if enabled is None:
+        return JSONResponse({"error": "expected {\"enabled\": true|false}"}, status_code=400)
+
+    await set_toggle(name, enabled)
+    if toggle("webhooks_enabled") and WEBHOOK_ADMIN_URL:
+        fire_webhook_bg(WEBHOOK_ADMIN_URL, {
+            "event":   "toggle_changed",
+            "toggle":  name,
+            "enabled": enabled,
+            "ip":      ip,
+            "timestamp": time.time(),
+        })
+    return JSONResponse({"ok": True, "toggle": name, "enabled": enabled})
+
+
+@app.post("/admin/toggles/reset")
+async def admin_reset_toggles(request: Request):
+    """Restore all toggles to compiled defaults."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    async with _toggles_lock:
+        _toggles.update(_TOGGLE_DEFAULTS)
+        _save_toggles_to_disk()
+    log.info("[ADMIN] toggles reset to defaults")
+    return JSONResponse({"ok": True, "toggles": dict(_TOGGLE_DEFAULTS)})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ADMIN — WEBHOOK STATUS
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/admin/webhooks")
+async def admin_webhook_status(request: Request):
+    """Show which webhooks are configured and their enabled state."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    configured = _configured_webhooks()
+    return JSONResponse({
+        "ok":              True,
+        "master_enabled":  toggle("webhooks_enabled"),
+        "configured":      configured,
+        "urls": {
+            "execution":  WEBHOOK_EXECUTION_URL  or None,
+            "secondary":  WEBHOOK_SECONDARY_URL  or None,
+            "admin":      WEBHOOK_ADMIN_URL      or None,
+            "logs":       WEBHOOK_LOGS_URL       or None,
+            "register":   WEBHOOK_REGISTER_URL   or None,
+            "login":      WEBHOOK_LOGIN_URL      or None,
+            "chat":       WEBHOOK_CHAT_URL       or None,
+            "blacklist":  WEBHOOK_BLACKLIST_URL  or None,
+        },
+    })
+
+
+@app.post("/admin/webhooks/test")
+async def admin_webhook_test(request: Request):
+    """Fire a test payload to every configured webhook."""
+    if not require_admin_session(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    configured = _configured_webhooks()
+    if not configured:
+        return JSONResponse({"ok": False, "error": "no webhooks configured"})
+    payload = {"event": "test", "message": "DexNotifier webhook test", "timestamp": time.time()}
+    for name, url in configured.items():
+        fire_webhook_bg(url, {**payload, "webhook": name})
+    return JSONResponse({"ok": True, "fired": list(configured.keys())})
+
 
 # -----------------------------
 # SIMPLE EXECUTOR CHECK
@@ -7270,7 +8087,17 @@ SLUG_LOADER_RATE_WINDOW = 10.0
 async def dynamic_loader(slug: str, request: Request):
     ip = _client_ip(request)
 
-    if rate_limited(ip, "slug_loader_get", max_requests=SLUG_LOADER_RATE_LIMIT, window_seconds=SLUG_LOADER_RATE_WINDOW):
+    # ── Global script-serving kill-switch ─────────────────────────────────
+    if not toggle("script_serving"):
+        return PlainTextResponse("-- Script serving is currently disabled.", status_code=503)
+
+    # ── Per-IP rate limit (respects toggle) ───────────────────────────────
+    if toggle("slug_rate_limiting") and rate_limited(
+        ip, "slug_loader_get",
+        max_requests=SLUG_LOADER_RATE_LIMIT,
+        window_seconds=SLUG_LOADER_RATE_WINDOW,
+    ):
+        log.debug(f"[LOADER] rate_limited ip={ip} slug={slug}")
         return PlainTextResponse("-- Rate limited, try again shortly.", status_code=429)
 
     if slug.lower() in RESERVED_PATHS_LOWER:
@@ -7289,28 +8116,43 @@ async def dynamic_loader(slug: str, request: Request):
                     s = v
                     break
         if not s:
-            # Confirmed executor request, just for a slug that doesn't
-            # exist - plain text so it fails cleanly inside loadstring()
-            # instead of dumping an HTML page into their script.
+            log.debug(f"[LOADER] not_found slug={slug} ip={ip}")
             return PlainTextResponse("-- Script not found.")
 
-        code = s.get("code", "")
-        is_paid = s.get("is_paid", False)
-        hwid_lock = s.get("hwid_lock", False)
-        actual_slug = s.get("slug", slug)
+        code             = s.get("code", "")
+        is_paid          = s.get("is_paid", False)
+        hwid_lock        = s.get("hwid_lock", False)
+        script_enabled   = s.get("script_enabled", True)
+        log_executions   = s.get("log_executions", False)
+        actual_slug      = s.get("slug", slug)
 
-    if not is_paid:
+    # ── Per-script enabled toggle ─────────────────────────────────────────
+    if not script_enabled:
+        if log_executions and toggle("execution_logging"):
+            await record_execution(actual_slug, ip, False, "script_disabled")
+        return PlainTextResponse("-- This script is currently disabled.")
+
+    # ── Free (no key required) path ───────────────────────────────────────
+    if not is_paid or not toggle("paid_key_validation"):
+        if log_executions and toggle("execution_logging"):
+            await record_execution(actual_slug, ip, True, "free")
+        log.info(f"[LOADER] served slug={actual_slug} ip={ip} type=free")
         return PlainTextResponse(code)
 
+    # ── Paid-key validation ───────────────────────────────────────────────
     if await is_rate_limited("slug_key_guess", ip):
         return PlainTextResponse("-- Too many invalid key attempts. Try again later.", status_code=429)
 
-    key = request.query_params.get("key", "").strip()
+    key  = request.query_params.get("key",  "").strip()
     hwid = request.query_params.get("hwid", "").strip()
 
     if not key:
+        if log_executions and toggle("execution_logging"):
+            await record_execution(actual_slug, ip, False, "missing_key")
         return PlainTextResponse("-- Missing paid key.")
-    if hwid_lock and not hwid:
+    if hwid_lock and toggle("hwid_enforcement") and not hwid:
+        if log_executions and toggle("execution_logging"):
+            await record_execution(actual_slug, ip, False, "missing_hwid")
         return PlainTextResponse("-- Missing HWID for locked script.")
 
     async with scripts_lock:
@@ -7327,29 +8169,44 @@ async def dynamic_loader(slug: str, request: Request):
 
         if matched_key is None:
             await record_failed_attempt("slug_key_guess", ip)
+            if log_executions and toggle("execution_logging"):
+                await record_execution(actual_slug, ip, False, "invalid_key", hwid=hwid, key=key)
+            log.info(f"[LOADER] invalid_key slug={actual_slug} ip={ip}")
             return PlainTextResponse("-- Invalid paid key.")
 
-        info = keys[matched_key]
-        expiry = info.get("expiry", 0)
+        info       = keys[matched_key]
+        expiry     = info.get("expiry", 0)
         bound_hwid = info.get("hwid")
-        now = time.time()
+        now        = time.time()
+
         if now > expiry:
             keys.pop(matched_key, None)
             s["keys"] = keys
             save_scripts_to_file()
+            if log_executions and toggle("execution_logging"):
+                await record_execution(actual_slug, ip, False, "key_expired", hwid=hwid, key=key)
+            log.info(f"[LOADER] key_expired slug={actual_slug} ip={ip}")
             return PlainTextResponse("-- Paid key expired.")
-        if hwid_lock:
+
+        if hwid_lock and toggle("hwid_enforcement"):
             if bound_hwid is None:
                 info["hwid"] = hwid
                 keys[matched_key] = info
                 s["keys"] = keys
                 save_scripts_to_file()
-            else:
-                if not constant_time_eq(bound_hwid, hwid):
-                    await record_failed_attempt("slug_key_guess", ip)
-                    return PlainTextResponse("-- HWID mismatch for this key.")
+                log.info(f"[LOADER] hwid_bound slug={actual_slug} ip={ip}")
+            elif not constant_time_eq(bound_hwid, hwid):
+                await record_failed_attempt("slug_key_guess", ip)
+                if log_executions and toggle("execution_logging"):
+                    await record_execution(actual_slug, ip, False, "hwid_mismatch", hwid=hwid, key=key)
+                log.info(f"[LOADER] hwid_mismatch slug={actual_slug} ip={ip}")
+                return PlainTextResponse("-- HWID mismatch for this key.")
 
     await clear_attempts("slug_key_guess", ip)
+
+    if log_executions and toggle("execution_logging"):
+        await record_execution(actual_slug, ip, True, "paid", hwid=hwid, key=key)
+    log.info(f"[LOADER] served slug={actual_slug} ip={ip} type=paid")
     return PlainTextResponse(code)
 
 
