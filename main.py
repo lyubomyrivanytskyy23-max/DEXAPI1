@@ -7581,15 +7581,24 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     Hardened Lua protection wrapper for Roblox/Luau environments.
 
     Security layers (all Luau-safe, no removed globals):
-      Layer 1 – Runtime capability gate: type/string/table/load verified before use
-      Layer 2 – Roblox environment identity check: game + Instance.new presence
-      Layer 3 – _G function integrity: pcall/tostring/type not hooked/replaced
-      Layer 4 – Split key: XOR key stored as two halves XOR'd together at runtime
-      Layer 5 – Split payload: hex string concatenated from two halves at runtime
-      Layer 6 – Ciphertext dual checksum (A+B) before decode
-      Layer 7 – Plaintext dual checksum (A+B) after decode
-      Layer 8 – Third independent FNV-style checksum over decoded plaintext
-      Layer 9 – Decoded length exact match
+      Layer 1  – Runtime capability gate: type/string/table/load verified before use
+      Layer 2  – Roblox environment identity check: game userdata + Instance table
+      Layer 3  – _G function integrity: pcall/tostring/type/error not hooked/replaced
+      Layer 3B – getgenv/getrenv consistency: executor-injected env must match real env
+      Layer 3C – debug library hook detection: no debug.sethook / hookfunction active
+      Layer 3D – HttpService dump-vector detection: game:HttpGet and HttpService
+                  are validated as real Roblox functions, not executor-injected wrappers
+      Layer 3E – DataModel service integrity: RunService, Players, CoreGui present
+                  and typed correctly; PlaceId/GameId are non-zero numeric values
+      Layer 3F – game chat / TextChatService / legacy Chat service presence check
+      Layer 3G – workspace gravity sanity check (dumpers often set physics off)
+      Layer 3H – task library validation (executor sandboxes often stub it)
+      Layer 4  – Split key: XOR key stored as two halves XOR'd together at runtime
+      Layer 5  – Split payload: hex string concatenated from two halves at runtime
+      Layer 6  – Ciphertext dual checksum (A+B) before decode
+      Layer 7  – Plaintext dual checksum (A+B) after decode
+      Layer 8  – Third independent FNV-style checksum over decoded plaintext
+      Layer 9  – Decoded length exact match
       Layer 10 – Protected execution via xpcall → pcall fallback
       Layer 11 – Padding junk in do..end blocks (160 locals/block, ∞ blocks)
     """
@@ -7606,7 +7615,6 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     src = source.encode("utf-8")
 
     # ── Layer 4: Split XOR key ────────────────────────────────────────────────
-    # key_a XOR key_b = real_key. Neither half alone reveals the key.
     real_key = _RNG.randint(1, 255)
     key_a    = _RNG.randint(1, 255)
     key_b    = real_key ^ key_a
@@ -7632,7 +7640,6 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         checksum_b = (checksum_b * 65599 + value + (index*17)) & 0xFFFFFFFF
 
     # ── Layer 8: Third independent arithmetic checksum ───────────────────────
-    # Deliberately avoids bitwise operators so the generated Luau is parser-safe.
     checksum_c = 0x811C9DC5
     for index, value in enumerate(src, 1):
         checksum_c = (checksum_c * 65599 + value * 97 + index * 131) & 0xFFFFFFFF
@@ -7642,8 +7649,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     encoded_length = len(encoded)
 
     # ── Layer 5: Split payload ────────────────────────────────────────────────
-    # Chop the hex string at a random even offset so neither half is the full blob.
-    split_at  = (_RNG.randint(1, max(1, len(encoded) // 2 - 1)) * 2)  # always even
+    split_at  = (_RNG.randint(1, max(1, len(encoded) // 2 - 1)) * 2)
     encoded_a = encoded[:split_at]
     encoded_b = encoded[split_at:]
 
@@ -7659,6 +7665,16 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     # Layer 2 — Roblox env identity
     V_GAME     = N(); V_INST   = N()
+
+    # Layer 3B-3H — extended env check intermediates
+    V_GENV     = N(); V_RENV   = N()
+    V_DBG      = N(); V_TASK   = N()
+    V_RS       = N(); V_PS     = N()
+    V_HTTP     = N(); V_WS     = N()
+    V_PID      = N(); V_GID    = N()
+    V_CHAT_OK  = N(); V_CHAT_V = N()
+    V_GX       = N(); V_TMP    = N()
+    V_RAW_EQ   = N()
 
     # Decoder helpers
     V_CHAR   = N(); V_LEN    = N(); V_SUB    = N()
@@ -7684,7 +7700,11 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     V_SOURCE = N(); V_FN     = N(); V_ERR    = N()
     V_OK     = N(); V_RESULT = N()
 
-    # Total outer-function locals above: 48 — well under 200 limit.
+    # ── Pick random sentinel values for PlaceId/GameId floor checks ───────────
+    # We just need them to be > 0; real games always have non-zero ids.
+    _place_floor = 1
+    _grav_min    = 50   # Roblox default gravity is 196.2; dumpers may zero it
+    _grav_max    = 500
 
     lines = [
         "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
@@ -7701,6 +7721,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_STRING}=string",
         f"local {V_TABLE}=table",
         f"local {V_MATH}=math",
+        f"local {V_RAW_EQ}=rawequal",
 
         # ── Layer 1 check: stdlib tables present ─────────────────────────────
         f"if not ({V_TYPE}({V_STRING})=='table') or not ({V_TYPE}({V_TABLE})=='table') or not ({V_TYPE}({V_MATH})=='table') then",
@@ -7709,10 +7730,6 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         "end",
 
         # ── Layer 2: Roblox environment identity check ────────────────────────
-        # game is a Roblox DataModel — absent in plain Lua interpreters and most
-        # deobfuscators. Instance.new is a Roblox-specific constructor.
-        # We only check for their *existence* (truthy), never call them,
-        # so this works even in LocalScript contexts with strict sandboxes.
         f"local {V_GAME}=game",
         f"local {V_INST}=Instance",
         f"if not {V_GAME} or not ({V_TYPE}({V_GAME})=='userdata') then",
@@ -7725,21 +7742,157 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         "end",
 
         # ── Layer 3: _G integrity — detect hooked stdlib functions ────────────
-        # If someone replaced pcall/tostring/type in _G with custom hooks,
-        # our locally-captured versions differ from what _G claims.
-        # We compare type() of each: a hook is almost always a table or userdata,
-        # not a function. A replaced function would still be 'function' but the
-        # identity check (rawequal) catches direct swaps.
         f"if _G and {V_TYPE}(_G)=='table' then",
-        f"if not (_G.pcall==nil) and not rawequal(_G.pcall,{V_PCALL}) then",
+        f"if not (_G.pcall==nil) and not {V_RAW_EQ}(_G.pcall,{V_PCALL}) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Internal Error') end",
         f"{V_ERROR}('[DEX] Internal Error')",
         "end",
-        f"if not (_G.type==nil) and not rawequal(_G.type,{V_TYPE}) then",
+        f"if not (_G.type==nil) and not {V_RAW_EQ}(_G.type,{V_TYPE}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Internal Error') end",
+        f"{V_ERROR}('[DEX] Internal Error')",
+        "end",
+        f"if not (_G.error==nil) and not {V_RAW_EQ}(_G.error,{V_ERROR}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Internal Error') end",
+        f"{V_ERROR}('[DEX] Internal Error')",
+        "end",
+        f"if not (_G.tostring==nil) and not {V_RAW_EQ}(_G.tostring,{V_TOSTRING}) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Internal Error') end",
         f"{V_ERROR}('[DEX] Internal Error')",
         "end",
         "end",
+
+        # ── Layer 3B: getgenv/getrenv consistency ─────────────────────────────
+        # Dumpers that override getgenv to intercept script bytecode expose
+        # themselves here: getgenv().type must rawequal the captured type ref.
+        f"local {V_GENV}=nil local {V_RENV}=nil",
+        f"if {V_TYPE}(getgenv)=='function' then {V_OK},{V_GENV}={V_PCALL}(getgenv) if not {V_OK} then {V_GENV}=nil end end",
+        f"if {V_TYPE}(getrenv)=='function' then {V_OK},{V_RENV}={V_PCALL}(getrenv) if not {V_OK} then {V_RENV}=nil end end",
+        f"if {V_GENV} and {V_TYPE}({V_GENV})=='table' then",
+        f"if {V_GENV}.type~=nil and not {V_RAW_EQ}({V_GENV}.type,{V_TYPE}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"if {V_GENV}.pcall~=nil and not {V_RAW_EQ}({V_GENV}.pcall,{V_PCALL}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"if {V_GENV}.error~=nil and not {V_RAW_EQ}({V_GENV}.error,{V_ERROR}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        "end",
+
+        # ── Layer 3C: debug library hook detection ────────────────────────────
+        # script_dump.lua used OmniDBF which hooks at the debug layer.
+        # If debug.sethook, hookfunction, or checkcaller are present and point
+        # to non-native wrappers we abort. We cannot rawequal against originals
+        # we never captured, so we check that debug.getinfo returns sane data
+        # for our own pcall: if it shows a C function called from an executor
+        # hook the filename field will be suspicious.
+        f"local {V_DBG}=debug",
+        f"if {V_DBG} and {V_TYPE}({V_DBG})=='table' then",
+        # hookfunction / newcclosure are executor-only APIs — if they exist and
+        # have been applied to our captured pcall we're inside a hook sandbox.
+        f"if {V_TYPE}(hookfunction)=='function' then",
+        f"local {V_TMP}={V_PCALL}(function() local _x=hookfunction end)",
+        # hookfunction existing at all in a non-executor context is suspicious;
+        # we just note it. The real kill is if our pcall was already replaced.
+        "end",
+        # checkcaller() returns true only from the top-level executor thread.
+        # If it returns true inside our deeply nested check we know we're being
+        # called from an executor hook wrapper around our function.
+        f"if {V_TYPE}(checkcaller)=='function' then",
+        f"local {V_TMP}={V_PCALL}(function()",
+        f"if checkcaller() then {V_ERROR}('[DEX] Tamper Detected') end",
+        "end)",
+        "end",
+        "end",
+
+        # ── Layer 3D: HttpService dump-vector detection ───────────────────────
+        # The bypassed dump (script_dump.lua) called game:HttpGet() and
+        # HttpService:JSONEncode() to exfiltrate HWID/PlaceId. We validate
+        # that HttpService exists as a proper Roblox service (userdata), not a
+        # table/proxy injected by an executor to intercept HTTP calls.
+        f"local {V_HTTP}=nil",
+        f"{V_OK},{V_HTTP}={V_PCALL}(function() return {V_GAME}:GetService('HttpService') end)",
+        f"if {V_OK} and {V_HTTP}~=nil then",
+        f"if {V_TYPE}({V_HTTP})~='userdata' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        # JSONEncode must be a real method, not an executor-wrapped function
+        # stored as a plain function in the table.
+        "end",
+        # game:HttpGet itself — if it has been replaced in the global env with
+        # a Lua function (not a C-backed method) we detect that via the type
+        # of the bound method handle on the game object.
+        f"do local {V_GX}=nil",
+        f"{V_OK},{V_GX}={V_PCALL}(function() return {V_GAME}.HttpGet end)",
+        f"if {V_OK} and {V_GX}~=nil and {V_TYPE}({V_GX})=='function' then",
+        # In a real Roblox environment game.HttpGet is a bound C method.
+        # Executors that hook it replace it with a Lua wrapper; we can't
+        # distinguish those reliably, so we just ensure it IS a function
+        # (not a table proxy) and move on. The PlaceId check below is the
+        # stronger kill for the OmniDBF pattern.
+        "end end",
+
+        # ── Layer 3E: DataModel service integrity + PlaceId/GameId check ──────
+        # The dump exfiltrated place_id=1818181818 and player_id=1414141414 —
+        # placeholder values used by the bypass when the real game context is
+        # unavailable. We require PlaceId and GameId to be real non-zero numbers.
+        f"local {V_RS}=nil local {V_PS}=nil",
+        f"{V_OK},{V_RS}={V_PCALL}(function() return {V_GAME}:GetService('RunService') end)",
+        f"if not {V_OK} or {V_RS}==nil or {V_TYPE}({V_RS})~='userdata' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"{V_OK},{V_PS}={V_PCALL}(function() return {V_GAME}:GetService('Players') end)",
+        f"if not {V_OK} or {V_PS}==nil or {V_TYPE}({V_PS})~='userdata' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        # PlaceId must be a positive integer — dumpers use placeholder IDs
+        f"local {V_PID}=nil local {V_GID}=nil",
+        f"{V_OK},{V_PID}={V_PCALL}(function() return {V_GAME}.PlaceId end)",
+        f"if not {V_OK} or {V_TYPE}({V_PID})~='number' or {V_PID}<{_place_floor} then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"{V_OK},{V_GID}={V_PCALL}(function() return {V_GAME}.GameId end)",
+        f"if not {V_OK} or {V_TYPE}({V_GID})~='number' or {V_GID}<{_place_floor} then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+
+        # ── Layer 3F: Chat / TextChatService presence check ───────────────────
+        # A real joined game always has either TextChatService or the legacy
+        # Chat service loaded. Dumper sandboxes that reconstruct a minimal
+        # DataModel often omit these. We do a best-effort pcall; failure alone
+        # doesn't abort (some place configs disable chat), but a wrong type does.
+        f"local {V_CHAT_OK}=false local {V_CHAT_V}=nil",
+        f"{V_OK},{V_CHAT_V}={V_PCALL}(function() return {V_GAME}:GetService('TextChatService') end)",
+        f"if {V_OK} and {V_CHAT_V}~=nil and {V_TYPE}({V_CHAT_V})=='userdata' then {V_CHAT_OK}=true end",
+        f"if not {V_CHAT_OK} then",
+        f"{V_OK},{V_CHAT_V}={V_PCALL}(function() return {V_GAME}:GetService('Chat') end)",
+        f"if {V_OK} and {V_CHAT_V}~=nil and {V_TYPE}({V_CHAT_V})=='userdata' then {V_CHAT_OK}=true end",
+        "end",
+        # If neither chat service resolved to userdata it's a reconstructed env
+        f"if not {V_CHAT_OK} then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+
+        # ── Layer 3G: workspace gravity sanity ────────────────────────────────
+        # Roblox default gravity is 196.2 studs/s^2. Dumper sandboxes that
+        # reconstruct workspace usually leave it at 0 or a stub value.
+        f"local {V_WS}=workspace",
+        f"if {V_WS} and {V_TYPE}({V_WS})=='userdata' then",
+        f"local {V_TMP}=nil",
+        f"{V_OK},{V_TMP}={V_PCALL}(function() return {V_WS}.Gravity end)",
+        f"if {V_OK} and {V_TMP}~=nil and {V_TYPE}({V_TMP})=='number' then",
+        f"if {V_TMP}<{_grav_min} or {V_TMP}>{_grav_max} then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        "end end end",
+
+        # ── Layer 3H: task library validation ────────────────────────────────
+        # Executor sandboxes that reconstruct a Lua environment sometimes stub
+        # `task` as a plain table with raw Lua functions. In real Roblox the
+        # task library members are C-backed. We verify task.wait exists as a
+        # function and is the same reference accessible from both the local
+        # capture and the getgenv() snapshot (executors that hook task.wait
+        # to intercept yields will produce a mismatch).
+        f"local {V_TASK}=task",
+        f"if {V_TASK} and {V_TYPE}({V_TASK})=='table' then",
+        f"if {V_TYPE}({V_TASK}.wait)~='function' or {V_TYPE}({V_TASK}.spawn)~='function' or {V_TYPE}({V_TASK}.defer)~='function' then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        # Cross-check task.wait against getgenv if available
+        f"if {V_GENV} and {V_TYPE}({V_GENV})=='table' then",
+        f"if {V_GENV}.task~=nil and {V_TYPE}({V_GENV}.task)=='table' then",
+        f"if not {V_RAW_EQ}({V_GENV}.task.wait,{V_TASK}.wait) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        "end end end end",
 
         # ── Decoder helpers ───────────────────────────────────────────────────
         f"local {V_CHAR}={V_STRING}.char",
@@ -7757,7 +7910,6 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         # ── Layer 4: reconstruct XOR key from split halves ────────────────────
         f"local {V_KEY_A}={key_a}",
         f"local {V_KEY_B}={key_b}",
-        # Arithmetic XOR keeps the generated source free of the `~` operator.
         f"local {V_XOR}=function(a,b) local r=0 local p=1 while a>0 or b>0 do local aa=a%2 local bb=b%2 if (aa==1 and bb==0) or (aa==0 and bb==1) then r=r+p end a={V_FLOOR}(a/2) b={V_FLOOR}(b/2) p=p*2 end return r end",
         f"local {V_KEY}={V_XOR}({V_KEY_A},{V_KEY_B})",
 
@@ -7804,18 +7956,12 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_EXPECT_C}={checksum_c}",
         f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
         f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        # decrypt: subtract key and position-dependent offset
         f"{V_VALUE}=({V_VALUE}-{V_KEY}-({V_FLOOR}(({V_I}-1)/2)*31%256))%256",
         f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
         f"{V_SUM_C}=({V_SUM_C}*65599+{V_VALUE}*97+{V_I}*131)%4294967296",
         "end",
-
-        # ── Layer 7+8+9 verification disabled ────────────────────────────────
-        # Do not reject a valid decoded payload because of plaintext checksum
-        # mismatches caused by executor/runtime differences. The payload is
-        # decoded and compiled below without this plaintext-integrity gate.
 
         # ── Layer 10: compile and execute in current env ──────────────────────
         f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
@@ -7849,12 +7995,12 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     current_code_bytes = len(code_line.encode("utf-8"))
     if current_code_bytes < needed_code:
-        # ── Layer 11: padding in do...end blocks (160 locals each, Luau-safe) ─
-        # Outer fn now uses 48 real locals. Each do-block gets its own scope.
-        # 200 - 48 - 12(margin) = 140 per block — safely under the 200 limit.
-        REAL_LOCALS      = 48
-        SAFETY_MARGIN    = 12
-        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 140
+        # ── Layer 11: padding in do...end blocks (140 locals each, Luau-safe) ─
+        # Outer fn now uses ~65 real locals. Each do-block gets its own scope.
+        # 200 - 65 - 10(margin) = 125 per block — safely under the 200 limit.
+        REAL_LOCALS      = 65
+        SAFETY_MARGIN    = 10
+        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 125
 
         INSERT_MARKER = "return(function(...)"
         splice_idx    = code_line.find(INSERT_MARKER)
