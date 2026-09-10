@@ -7762,137 +7762,192 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         "end",
 
         # ── Layer 3B: getgenv/getrenv consistency ─────────────────────────────
-        # Dumpers that override getgenv to intercept script bytecode expose
-        # themselves here: getgenv().type must rawequal the captured type ref.
-        f"local {V_GENV}=nil local {V_RENV}=nil",
-        f"if {V_TYPE}(getgenv)=='function' then {V_OK},{V_GENV}={V_PCALL}(getgenv) if not {V_OK} then {V_GENV}=nil end end",
-        f"if {V_TYPE}(getrenv)=='function' then {V_OK},{V_RENV}={V_PCALL}(getrenv) if not {V_OK} then {V_RENV}=nil end end",
-        f"if {V_GENV} and {V_TYPE}({V_GENV})=='table' then",
+        # Each check is a standalone pcall closure so `local` decls are scoped
+        # inside a function body — valid in every Luau parser version.
+        f"local {V_GENV}=nil",
+        f"local {V_RENV}=nil",
+        f"if {V_TYPE}(getgenv)=='function' then",
+        f"local _ok2,_gv={V_PCALL}(getgenv)",
+        f"if _ok2 then",
+        f"{V_GENV}=_gv",
+        "end",
+        "end",
+        f"if {V_TYPE}(getrenv)=='function' then",
+        f"local _ok3,_rv={V_PCALL}(getrenv)",
+        f"if _ok3 then",
+        f"{V_RENV}=_rv",
+        "end",
+        "end",
+        f"if {V_GENV}~=nil and {V_TYPE}({V_GENV})=='table' then",
         f"if {V_GENV}.type~=nil and not {V_RAW_EQ}({V_GENV}.type,{V_TYPE}) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
         f"if {V_GENV}.pcall~=nil and not {V_RAW_EQ}({V_GENV}.pcall,{V_PCALL}) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
         f"if {V_GENV}.error~=nil and not {V_RAW_EQ}({V_GENV}.error,{V_ERROR}) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
         "end",
 
-        # ── Layer 3C: debug library hook detection ────────────────────────────
-        # script_dump.lua used OmniDBF which hooks at the debug layer.
-        # If debug.sethook, hookfunction, or checkcaller are present and point
-        # to non-native wrappers we abort. We cannot rawequal against originals
-        # we never captured, so we check that debug.getinfo returns sane data
-        # for our own pcall: if it shows a C function called from an executor
-        # hook the filename field will be suspicious.
-        f"local {V_DBG}=debug",
-        f"if {V_DBG} and {V_TYPE}({V_DBG})=='table' then",
-        # hookfunction / newcclosure are executor-only APIs — if they exist and
-        # have been applied to our captured pcall we're inside a hook sandbox.
-        f"if {V_TYPE}(hookfunction)=='function' then",
-        f"local {V_TMP}={V_PCALL}(function() local _x=hookfunction end)",
-        # hookfunction existing at all in a non-executor context is suspicious;
-        # we just note it. The real kill is if our pcall was already replaced.
-        "end",
-        # checkcaller() returns true only from the top-level executor thread.
-        # If it returns true inside our deeply nested check we know we're being
-        # called from an executor hook wrapper around our function.
+        # ── Layer 3C: checkcaller / hookfunction detection ────────────────────
+        # Wrapped in pcall closures so `local` is always inside a function body.
         f"if {V_TYPE}(checkcaller)=='function' then",
-        f"local {V_TMP}={V_PCALL}(function()",
-        f"if checkcaller() then {V_ERROR}('[DEX] Tamper Detected') end",
-        "end)",
+        f"{V_PCALL}(function()",
+        f"if checkcaller() then",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
+        "end)",
         "end",
 
         # ── Layer 3D: HttpService dump-vector detection ───────────────────────
-        # The bypassed dump (script_dump.lua) called game:HttpGet() and
-        # HttpService:JSONEncode() to exfiltrate HWID/PlaceId. We validate
-        # that HttpService exists as a proper Roblox service (userdata), not a
-        # table/proxy injected by an executor to intercept HTTP calls.
         f"local {V_HTTP}=nil",
-        f"{V_OK},{V_HTTP}={V_PCALL}(function() return {V_GAME}:GetService('HttpService') end)",
-        f"if {V_OK} and {V_HTTP}~=nil then",
+        f"do",
+        f"local _ok4,_hs={V_PCALL}(function()",
+        f"return {V_GAME}:GetService('HttpService')",
+        "end)",
+        f"if _ok4 and _hs~=nil then",
+        f"{V_HTTP}=_hs",
         f"if {V_TYPE}({V_HTTP})~='userdata' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
-        # JSONEncode must be a real method, not an executor-wrapped function
-        # stored as a plain function in the table.
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
         "end",
-        # game:HttpGet itself — if it has been replaced in the global env with
-        # a Lua function (not a C-backed method) we detect that via the type
-        # of the bound method handle on the game object.
-        f"do local {V_GX}=nil",
-        f"{V_OK},{V_GX}={V_PCALL}(function() return {V_GAME}.HttpGet end)",
-        f"if {V_OK} and {V_GX}~=nil and {V_TYPE}({V_GX})=='function' then",
-        # In a real Roblox environment game.HttpGet is a bound C method.
-        # Executors that hook it replace it with a Lua wrapper; we can't
-        # distinguish those reliably, so we just ensure it IS a function
-        # (not a table proxy) and move on. The PlaceId check below is the
-        # stronger kill for the OmniDBF pattern.
-        "end end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        "end",
+        "end",
 
         # ── Layer 3E: DataModel service integrity + PlaceId/GameId check ──────
-        # The dump exfiltrated place_id=1818181818 and player_id=1414141414 —
-        # placeholder values used by the bypass when the real game context is
-        # unavailable. We require PlaceId and GameId to be real non-zero numbers.
-        f"local {V_RS}=nil local {V_PS}=nil",
-        f"{V_OK},{V_RS}={V_PCALL}(function() return {V_GAME}:GetService('RunService') end)",
-        f"if not {V_OK} or {V_RS}==nil or {V_TYPE}({V_RS})~='userdata' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
-        f"{V_OK},{V_PS}={V_PCALL}(function() return {V_GAME}:GetService('Players') end)",
-        f"if not {V_OK} or {V_PS}==nil or {V_TYPE}({V_PS})~='userdata' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
-        # PlaceId must be a positive integer — dumpers use placeholder IDs
-        f"local {V_PID}=nil local {V_GID}=nil",
-        f"{V_OK},{V_PID}={V_PCALL}(function() return {V_GAME}.PlaceId end)",
-        f"if not {V_OK} or {V_TYPE}({V_PID})~='number' or {V_PID}<{_place_floor} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
-        f"{V_OK},{V_GID}={V_PCALL}(function() return {V_GAME}.GameId end)",
-        f"if not {V_OK} or {V_TYPE}({V_GID})~='number' or {V_GID}<{_place_floor} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"local {V_RS}=nil",
+        f"local {V_PS}=nil",
+        f"do",
+        f"local _ok5,_rs={V_PCALL}(function()",
+        f"return {V_GAME}:GetService('RunService')",
+        "end)",
+        f"if not _ok5 or _rs==nil or {V_TYPE}(_rs)~='userdata' then",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_RS}=_rs",
+        "end",
+        f"do",
+        f"local _ok6,_ps={V_PCALL}(function()",
+        f"return {V_GAME}:GetService('Players')",
+        "end)",
+        f"if not _ok6 or _ps==nil or {V_TYPE}(_ps)~='userdata' then",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_PS}=_ps",
+        "end",
+        f"local {V_PID}=nil",
+        f"local {V_GID}=nil",
+        f"do",
+        f"local _ok7,_pid={V_PCALL}(function()",
+        f"return {V_GAME}.PlaceId",
+        "end)",
+        f"if not _ok7 or {V_TYPE}(_pid)~='number' or _pid<{_place_floor} then",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_PID}=_pid",
+        "end",
+        f"do",
+        f"local _ok8,_gid={V_PCALL}(function()",
+        f"return {V_GAME}.GameId",
+        "end)",
+        f"if not _ok8 or {V_TYPE}(_gid)~='number' or _gid<{_place_floor} then",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_GID}=_gid",
+        "end",
 
         # ── Layer 3F: Chat / TextChatService presence check ───────────────────
-        # A real joined game always has either TextChatService or the legacy
-        # Chat service loaded. Dumper sandboxes that reconstruct a minimal
-        # DataModel often omit these. We do a best-effort pcall; failure alone
-        # doesn't abort (some place configs disable chat), but a wrong type does.
-        f"local {V_CHAT_OK}=false local {V_CHAT_V}=nil",
-        f"{V_OK},{V_CHAT_V}={V_PCALL}(function() return {V_GAME}:GetService('TextChatService') end)",
-        f"if {V_OK} and {V_CHAT_V}~=nil and {V_TYPE}({V_CHAT_V})=='userdata' then {V_CHAT_OK}=true end",
-        f"if not {V_CHAT_OK} then",
-        f"{V_OK},{V_CHAT_V}={V_PCALL}(function() return {V_GAME}:GetService('Chat') end)",
-        f"if {V_OK} and {V_CHAT_V}~=nil and {V_TYPE}({V_CHAT_V})=='userdata' then {V_CHAT_OK}=true end",
+        f"local {V_CHAT_OK}=false",
+        f"local {V_CHAT_V}=nil",
+        f"do",
+        f"local _ok9,_cs={V_PCALL}(function()",
+        f"return {V_GAME}:GetService('TextChatService')",
+        "end)",
+        f"if _ok9 and _cs~=nil and {V_TYPE}(_cs)=='userdata' then",
+        f"{V_CHAT_OK}=true",
+        f"{V_CHAT_V}=_cs",
         "end",
-        # If neither chat service resolved to userdata it's a reconstructed env
+        "end",
         f"if not {V_CHAT_OK} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
+        f"do",
+        f"local _ok10,_cs2={V_PCALL}(function()",
+        f"return {V_GAME}:GetService('Chat')",
+        "end)",
+        f"if _ok10 and _cs2~=nil and {V_TYPE}(_cs2)=='userdata' then",
+        f"{V_CHAT_OK}=true",
+        f"{V_CHAT_V}=_cs2",
+        "end",
+        "end",
+        "end",
+        f"if not {V_CHAT_OK} then",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
 
         # ── Layer 3G: workspace gravity sanity ────────────────────────────────
-        # Roblox default gravity is 196.2 studs/s^2. Dumper sandboxes that
-        # reconstruct workspace usually leave it at 0 or a stub value.
         f"local {V_WS}=workspace",
-        f"if {V_WS} and {V_TYPE}({V_WS})=='userdata' then",
-        f"local {V_TMP}=nil",
-        f"{V_OK},{V_TMP}={V_PCALL}(function() return {V_WS}.Gravity end)",
-        f"if {V_OK} and {V_TMP}~=nil and {V_TYPE}({V_TMP})=='number' then",
-        f"if {V_TMP}<{_grav_min} or {V_TMP}>{_grav_max} then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
-        "end end end",
+        f"if {V_WS}~=nil and {V_TYPE}({V_WS})=='userdata' then",
+        f"do",
+        f"local _ok11,_grav={V_PCALL}(function()",
+        f"return {V_WS}.Gravity",
+        "end)",
+        f"if _ok11 and _grav~=nil and {V_TYPE}(_grav)=='number' then",
+        f"if _grav<{_grav_min} or _grav>{_grav_max} then",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        "end",
+        "end",
+        "end",
 
         # ── Layer 3H: task library validation ────────────────────────────────
-        # Executor sandboxes that reconstruct a Lua environment sometimes stub
-        # `task` as a plain table with raw Lua functions. In real Roblox the
-        # task library members are C-backed. We verify task.wait exists as a
-        # function and is the same reference accessible from both the local
-        # capture and the getgenv() snapshot (executors that hook task.wait
-        # to intercept yields will produce a mismatch).
         f"local {V_TASK}=task",
-        f"if {V_TASK} and {V_TYPE}({V_TASK})=='table' then",
+        f"if {V_TASK}~=nil and {V_TYPE}({V_TASK})=='table' then",
         f"if {V_TYPE}({V_TASK}.wait)~='function' or {V_TYPE}({V_TASK}.spawn)~='function' or {V_TYPE}({V_TASK}.defer)~='function' then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
-        # Cross-check task.wait against getgenv if available
-        f"if {V_GENV} and {V_TYPE}({V_GENV})=='table' then",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        f"if {V_GENV}~=nil and {V_TYPE}({V_GENV})=='table' then",
         f"if {V_GENV}.task~=nil and {V_TYPE}({V_GENV}.task)=='table' then",
         f"if not {V_RAW_EQ}({V_GENV}.task.wait,{V_TASK}.wait) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end {V_ERROR}('[DEX] Tamper Detected') end",
-        "end end end end",
+        f"if {V_WARN} then",
+        f"{V_WARN}('[DEX] Tamper Detected')",
+        "end",
+        f"{V_ERROR}('[DEX] Tamper Detected')",
+        "end",
+        "end",
+        "end",
+        "end",
 
         # ── Decoder helpers ───────────────────────────────────────────────────
         f"local {V_CHAR}={V_STRING}.char",
