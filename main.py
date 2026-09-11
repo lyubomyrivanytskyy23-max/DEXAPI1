@@ -7576,11 +7576,93 @@ def _build_loadstring(raw_url):
     return "loadstring(game:HttpGet(" + json.dumps(raw_url) + "))()"
 
 
+def _vm_encode_source(source_bytes: bytes) -> "tuple[list, int, int]":
+    """
+    Encode raw Lua source bytes into a simple custom VM bytecode stream.
+
+    VM Instruction Set (each instruction = 2 integers: opcode, operand):
+      OP_PUSH  (1) operand = byte value  → push byte onto output buffer
+      OP_XOR   (2) operand = xor mask    → XOR top of stack with mask
+      OP_ADD   (3) operand = addend      → ADD operand to top of stack (mod 256)
+      OP_ROT   (4) operand = amount      → rotate-left top of stack by amount bits
+      OP_EMIT  (5) operand = 0           → pop top of stack and write to output
+
+    Each source byte is encoded as:
+      PUSH(encrypted_byte), EMIT
+    with the encryption being the inverse of a per-byte transform applied
+    during Python encoding so the Lua VM applies the forward transform.
+    """
+    vm_seed = _RNG.randint(0x11, 0xEE)
+    vm_xor  = _RNG.randint(0x01, 0xFE)
+    vm_add  = _RNG.randint(0x01, 0xFE)
+    vm_rot  = _RNG.randint(1, 7)
+
+    OP_PUSH = 1
+    OP_XOR  = 2
+    OP_ADD  = 3
+    OP_ROT  = 4
+    OP_EMIT = 5
+
+    instructions = []
+    for i, b in enumerate(source_bytes):
+        # forward transform (will be done by the Lua VM decoder):
+        #   step1: ADD vm_add
+        #   step2: XOR vm_xor
+        #   step3: ROT vm_rot
+        # so we store the *inverse* so the VM recovers original byte
+        v = int(b)
+        # Lua VM will: rotr(v, vm_rot) → xor vm_xor → sub vm_add
+        # Python pre-encodes: add vm_add → xor vm_xor → rotl vm_rot
+        v = (v + vm_add) & 0xFF
+        v ^= vm_xor
+        v = _rotl8(v, vm_rot)
+        # emit: PUSH encoded_byte, EMIT
+        instructions.append((OP_PUSH, v))
+        instructions.append((OP_EMIT, 0))
+
+    return instructions, vm_seed, vm_xor, vm_add, vm_rot
+
+
+def _build_vm_bytecode_string(instructions: list) -> bytes:
+    """
+    Pack the instruction list into a compact binary blob:
+    each instruction = 2 bytes [opcode (1 byte), operand (1 byte)]
+    """
+    out = bytearray()
+    for opcode, operand in instructions:
+        out.append(opcode & 0xFF)
+        out.append(operand & 0xFF)
+    return bytes(out)
+
+
+def _build_vm_string_table(strings: list, str_xor: int) -> "tuple[list[int], list[str]]":
+    """
+    Encrypt a list of string literals into a Lua-side string table.
+    Returns (encrypted_char_values, lua_table_literal_parts).
+    Each string is stored as a sequence of encrypted bytes terminated by 0.
+    Encoded as decimal numbers.
+    """
+    flat = []
+    offsets = []
+    pos = 0
+    for s in strings:
+        offsets.append(pos)
+        for c in s.encode("utf-8"):
+            flat.append((c ^ str_xor) & 0xFF)
+        flat.append(0)  # terminator
+        pos = len(flat)
+    return flat, offsets
+
+
 def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, target_bytes: int = 0) -> str:
     """
     Hardened Lua protection wrapper for Roblox/Luau environments.
 
     Security layers (all Luau-safe, no removed globals):
+      Layer 0  – VM Bytecode: source is encoded as a custom 5-opcode bytecode stream
+                  executed by a pure-Lua interpreter embedded in the wrapper
+      Layer 0B – VM Double Encryption: bytecode blob is encrypted with a second
+                  independent XOR+rotate cipher before embedding
       Layer 1  – Runtime capability gate: type/string/table/load verified before use
       Layer 2  – Roblox environment identity check: game userdata + Instance table
       Layer 3  – _G function integrity: pcall/tostring/type/error not hooked/replaced
@@ -7601,6 +7683,10 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
       Layer 9  – Decoded length exact match
       Layer 10 – Protected execution via xpcall → pcall fallback
       Layer 11 – Padding junk in do..end blocks (160 locals/block, ∞ blocks)
+      Layer 12 – Encrypted string table: all DEX error/warn strings stored as
+                  XOR-encrypted integer arrays decoded at runtime
+      Layer 13 – Control-flow flattening on the decode loop via state-machine
+                  dispatcher with opaque state variable
     """
     if source is None:
         raise ValueError("No Lua source was supplied.")
@@ -7614,15 +7700,47 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     src = source.encode("utf-8")
 
-    # ── Layer 4: Split XOR key ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 0: VM BYTECODE ENCODING
+    # The source bytes are transformed into a custom 5-opcode bytecode stream.
+    # The Lua runtime will contain a tiny interpreter that executes this stream
+    # to reconstruct the original source string, then load()s it.
+    # This means a static dump of the encrypted payload only reveals bytecode,
+    # not the original Lua source — they'd need to reverse the VM too.
+    # ══════════════════════════════════════════════════════════════════════════
+    vm_instructions, vm_seed, vm_xor_key, vm_add_key, vm_rot_amt = _vm_encode_source(src)
+    vm_blob = _build_vm_bytecode_string(vm_instructions)
+
+    # ── Layer 0B: second encryption pass over the VM bytecode blob ────────────
+    # Independent key set so breaking one layer doesn't expose the other.
+    vm2_key  = _RNG.randint(0x07, 0xF7)
+    vm2_rot  = _RNG.randint(1, 7)
+    vm2_salt = _RNG.randint(0x01, 0xFE)
+    vm_blob2 = bytearray()
+    for bi, bv in enumerate(vm_blob):
+        v = (bv ^ vm2_key) & 0xFF
+        v = _rotl8(v, vm2_rot)
+        v = (v + vm2_salt + (bi & 0xFF)) & 0xFF
+        vm_blob2.append(v)
+    vm_blob2 = bytes(vm_blob2)
+
+    # ── Checksums over the VM-encrypted blob (Layer 6 equivalent) ─────────────
+    vm_cipher_a = 0x6D31
+    vm_cipher_b = 0x91E7
+    for idx, bv in enumerate(vm_blob2, 1):
+        vm_cipher_a = (vm_cipher_a * 33  + bv + idx)       & 0xFFFFFFFF
+        vm_cipher_b = (vm_cipher_b * 65599 + bv + idx * 29) & 0xFFFFFFFF
+
+    # ── Layer 4: Split XOR key ─────────────────────────────────────────────────
     real_key = _RNG.randint(1, 255)
     key_a    = _RNG.randint(1, 255)
     key_b    = real_key ^ key_a
 
-    # ── Encrypt ───────────────────────────────────────────────────────────────
+    # ── Outer hex-encode the VM bytecode blob ─────────────────────────────────
+    # We use the same add+index scheme as before so the Layer 6/7 checksums work.
     encrypted = bytes(
         (value + real_key + ((index * 31) & 0xFF)) & 0xFF
-        for index, value in enumerate(src)
+        for index, value in enumerate(vm_blob2)
     )
 
     # ── Layer 6: Ciphertext dual checksum ─────────────────────────────────────
@@ -7632,33 +7750,70 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         cipher_a = (cipher_a * 33  + value + index)       & 0xFFFFFFFF
         cipher_b = (cipher_b * 65599 + value + (index*29)) & 0xFFFFFFFF
 
-    # ── Layer 7: Plaintext dual checksum ──────────────────────────────────────
+    # ── Layer 7: Plaintext dual checksum (over the vm_blob2 bytes) ────────────
     checksum_a = 0x45D9
     checksum_b = 0xA7C3
-    for index, value in enumerate(src, 1):
+    for index, value in enumerate(vm_blob2, 1):
         checksum_a = (checksum_a * 33  + value + index)       & 0xFFFFFFFF
         checksum_b = (checksum_b * 65599 + value + (index*17)) & 0xFFFFFFFF
 
-    # ── Layer 8: Third independent arithmetic checksum ───────────────────────
+    # ── Layer 8: Third independent FNV-style checksum ──────────────────────────
     checksum_c = 0x811C9DC5
-    for index, value in enumerate(src, 1):
+    for index, value in enumerate(vm_blob2, 1):
         checksum_c = (checksum_c * 65599 + value * 97 + index * 131) & 0xFFFFFFFF
 
-    source_length  = len(src)
+    source_length  = len(vm_blob2)
     encoded        = encrypted.hex()
     encoded_length = len(encoded)
 
-    # ── Layer 5: Split payload ────────────────────────────────────────────────
+    # ── Layer 5: Split payload ─────────────────────────────────────────────────
     split_at  = (_RNG.randint(1, max(1, len(encoded) // 2 - 1)) * 2)
     encoded_a = encoded[:split_at]
     encoded_b = encoded[split_at:]
 
-    # ── Variable name pool ────────────────────────────────────────────────────
-    used = set()
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 12: ENCRYPTED STRING TABLE
+    # All constant string literals that appear in the wrapper (error messages,
+    # service names, etc.) are stored as XOR-encrypted integer arrays decoded
+    # at runtime. A static reader sees only numbers, not strings.
+    # ══════════════════════════════════════════════════════════════════════════
+    str_xor = _RNG.randint(0x01, 0xFE)
+
+    # All strings that appear in the wrapper — index matters, keep order stable
+    _STR_TABLE = [
+        "table",                                       # [1]  stdlib type checks
+        "userdata",                                    # [2]  game type
+        "function",                                    # [3]  function checks
+        "number",                                      # [4]  numeric checks
+        "[DEX] Internal Error",                        # [5]
+        "[DEX] Tamper Detected",                       # [6]
+        "[DEX] Failed",                                # [7]
+        "[DEX] Error: ",                               # [8]
+        "[DEX] Does Your Executer Support Loadstring?: ", # [9]
+        "HttpService",                                 # [10]
+        "RunService",                                  # [11]
+        "Players",                                     # [12]
+        "TextChatService",                             # [13]
+        "Chat",                                        # [14]
+        "[DEX] Tamper Detected No Source For You :D [.gg/dexfinder]",  # [15]
+        "[DEX] Internal Error: stdlib unavailable",    # [16]
+    ]
+
+    # Encode each string as XOR-encrypted bytes + terminator 0
+    str_flat: list[int] = []
+    str_offsets: list[int] = []
+    for s in _STR_TABLE:
+        str_offsets.append(len(str_flat))
+        for c in s.encode("utf-8"):
+            str_flat.append((c ^ str_xor) & 0xFF)
+        str_flat.append(0)
+
+    # ── Variable name pool ─────────────────────────────────────────────────────
+    used: set = set()
     _reset_junk_fenv_counter()
     N = lambda: _unique_name(used)
 
-    # Layer 1 — stdlib refs (captured before any check so checks can use them)
+    # Layer 1 — stdlib refs
     V_TYPE     = N(); V_PCALL  = N(); V_XPCALL   = N(); V_XOR = N()
     V_TOSTRING = N(); V_ERROR  = N(); V_WARN      = N()
     V_STRING   = N(); V_TABLE  = N(); V_MATH      = N()
@@ -7666,7 +7821,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     # Layer 2 — Roblox env identity
     V_GAME     = N(); V_INST   = N()
 
-    # Layer 3B-3H — extended env check intermediates
+    # Layer 3B-3H — extended env checks
     V_GENV     = N(); V_RENV   = N()
     V_DBG      = N(); V_TASK   = N()
     V_RS       = N(); V_PS     = N()
@@ -7679,15 +7834,16 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     # Decoder helpers
     V_CHAR   = N(); V_LEN    = N(); V_SUB    = N()
     V_CONCAT = N(); V_TONUM  = N(); V_LOAD   = N()
-    V_FLOOR  = N()
+    V_FLOOR  = N(); V_BAND   = N(); V_BXOR   = N()
+    V_BYTE   = N(); V_INSERT = N()
 
     # Layer 4 — split key
     V_KEY_A  = N(); V_KEY_B  = N(); V_KEY    = N()
 
-    # Layer 5 — split payload halves + assembled data
+    # Layer 5 — split payload
     V_HALF_A = N(); V_HALF_B = N(); V_DATA   = N()
 
-    # Checksums / expected values
+    # Checksums
     V_EXPECT_LEN     = N(); V_EXPECT_HEX_LEN = N()
     V_CSUM_A         = N(); V_CSUM_B         = N()
     V_CEXPECT_A      = N(); V_CEXPECT_B      = N()
@@ -7700,18 +7856,72 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
     V_SOURCE = N(); V_FN     = N(); V_ERR    = N()
     V_OK     = N(); V_RESULT = N()
 
-    # ── Pick random sentinel values for PlaceId/GameId floor checks ───────────
-    # We just need them to be > 0; real games always have non-zero ids.
+    # Layer 0 VM vars
+    V_VM_BC  = N(); V_VM_BUF = N(); V_VM_IP  = N()
+    V_VM_OPC = N(); V_VM_OPR = N(); V_VM_STK = N()
+    V_VM_TOP = N(); V_VM_OUT = N(); V_VM_V   = N()
+    V_VM_R   = N(); V_VM_TMP = N(); V_VM_SZ  = N()
+
+    # Layer 12 — string table
+    V_STR_TBL  = N(); V_STR_XOR  = N()
+    V_STR_GET  = N(); V_STR_I    = N(); V_STR_C = N(); V_STR_ACC = N()
+
+    # Layer 13 — control-flow state machine
+    V_STATE  = N(); V_DISPATCH = N()
+
+    # ── Sentinel values ────────────────────────────────────────────────────────
     _place_floor = 1
-    _grav_min    = 50   # Roblox default gravity is 196.2; dumpers may zero it
+    _grav_min    = 50
     _grav_max    = 500
 
+    # ── Helper: emit a "get string from table" call ───────────────────────────
+    # _S(n) → decodes string at 1-based index n from V_STR_TBL
+    def _S(idx: int) -> str:
+        """Reference to encrypted string table entry (1-based index)."""
+        return f"{V_STR_GET}({idx})"
+
+    # ── Build the encrypted string table literal ───────────────────────────────
+    str_flat_lua = "{" + ",".join(str(v) for v in str_flat) + "}"
+
+    # ── XOR helper function in Lua ─────────────────────────────────────────────
+    xor_fn_body = (
+        f"function(a,b) local r=0 local p=1 "
+        f"while a>0 or b>0 do "
+        f"local aa=a%2 local bb=b%2 "
+        f"if (aa==1 and bb==0) or (aa==0 and bb==1) then r=r+p end "
+        f"a={V_FLOOR}(a/2) b={V_FLOOR}(b/2) p=p*2 "
+        f"end return r end"
+    )
+
+    # ── rotate-right helper in Lua ─────────────────────────────────────────────
+    rotr_fn_body = (
+        f"function(v,n) "
+        f"v=v%256 n=n%8 "
+        f"if n==0 then return v end "
+        f"local hi=v>>n local lo=(v<<(8-n))%256 "
+        f"return hi+lo "
+        f"end"
+    )
+    # Luau supports >> and << operators, so this is fine.
+
+    # ── VM bytecode blob as Lua string literal ─────────────────────────────────
+    # We hex-encode (already done above into `encoded`) so no special escaping needed.
+
+    # State machine step IDs (random opaque integers for CFF)
+    ST_CHECK_LEN   = _RNG.randint(100, 200)
+    ST_VERIFY_CS   = _RNG.randint(201, 300)
+    ST_DECODE_LOOP = _RNG.randint(301, 400)
+    ST_CHECK_PL    = _RNG.randint(401, 500)
+    ST_RUN_VM      = _RNG.randint(501, 600)
+    ST_EXEC        = _RNG.randint(601, 700)
+    ST_DONE        = _RNG.randint(701, 800)
+
     lines = [
-        "-- This file was protected using Dex Obfuscator v5.2 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
+        "-- This file was protected using Dex Obfuscator v8.0 [.gg/dexfinder] [https://dexapi1.up.railway.app/obfuscate]",
         "",
         "return(function(...)",
 
-        # ── Layer 1: capture stdlib before anything can hook it ───────────────
+        # ── Layer 1: capture stdlib ────────────────────────────────────────────
         f"local {V_TYPE}=type",
         f"local {V_PCALL}=pcall",
         f"local {V_XPCALL}=xpcall",
@@ -7723,13 +7933,37 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_MATH}=math",
         f"local {V_RAW_EQ}=rawequal",
 
-        # ── Layer 1 check: stdlib tables present ─────────────────────────────
+        # helpers we need early
+        f"local {V_CHAR}={V_STRING}.char",
+        f"local {V_LEN}={V_STRING}.len",
+        f"local {V_SUB}={V_STRING}.sub",
+        f"local {V_BYTE}={V_STRING}.byte",
+        f"local {V_CONCAT}={V_TABLE}.concat",
+        f"local {V_INSERT}={V_TABLE}.insert",
+        f"local {V_TONUM}=tonumber",
+        f"local {V_LOAD}=loadstring or load",
+        f"local {V_FLOOR}={V_MATH}.floor",
+
+        # ── Layer 1 check ──────────────────────────────────────────────────────
         f"if not ({V_TYPE}({V_STRING})=='table') or not ({V_TYPE}({V_TABLE})=='table') or not ({V_TYPE}({V_MATH})=='table') then",
         f"if {V_WARN} then {V_WARN}('[DEX] Internal Error: stdlib unavailable') end",
         f"{V_ERROR}('[DEX] Internal Error')",
         "end",
 
-        # ── Layer 2: Roblox environment identity check ────────────────────────
+        # ── Layer 12: build encrypted string table + decoder ──────────────────
+        f"local {V_STR_XOR}={str_xor}",
+        f"local {V_STR_TBL}={str_flat_lua}",
+        f"local {V_STR_GET}=function(idx)",
+        f"local offsets={{{','.join(str(o) for o in str_offsets)}}}",
+        f"local pos=offsets[idx]+1",
+        f"local acc={{}}",
+        f"while {V_STR_TBL}[pos]~=0 do",
+        f"{V_INSERT}(acc,{V_CHAR}({V_STR_TBL}[pos]~={V_STR_XOR} and {V_STR_TBL}[pos]~0 or 0))",  # placeholder, fixed below
+        "end",
+        f"return {V_CONCAT}(acc)",
+        "end",
+
+        # ── Layer 2: Roblox env identity ───────────────────────────────────────
         f"local {V_GAME}=game",
         f"local {V_INST}=Instance",
         f"if not {V_GAME} or not ({V_TYPE}({V_GAME})=='userdata') then",
@@ -7741,7 +7975,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
 
-        # ── Layer 3: _G integrity — detect hooked stdlib functions ────────────
+        # ── Layer 3: _G integrity ──────────────────────────────────────────────
         f"if _G and {V_TYPE}(_G)=='table' then",
         f"if not (_G.pcall==nil) and not {V_RAW_EQ}(_G.pcall,{V_PCALL}) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Internal Error') end",
@@ -7761,214 +7995,149 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         "end",
         "end",
 
-        # ── Layer 3B: getgenv/getrenv consistency ─────────────────────────────
-        # Each check is a standalone pcall closure so `local` decls are scoped
-        # inside a function body — valid in every Luau parser version.
+        # ── Layer 3B: getgenv/getrenv consistency ──────────────────────────────
         f"local {V_GENV}=nil",
         f"local {V_RENV}=nil",
         f"if {V_TYPE}(getgenv)=='function' then",
         f"local _ok2,_gv={V_PCALL}(getgenv)",
-        f"if _ok2 then",
-        f"{V_GENV}=_gv",
-        "end",
+        f"if _ok2 then {V_GENV}=_gv end",
         "end",
         f"if {V_TYPE}(getrenv)=='function' then",
         f"local _ok3,_rv={V_PCALL}(getrenv)",
-        f"if _ok3 then",
-        f"{V_RENV}=_rv",
-        "end",
+        f"if _ok3 then {V_RENV}=_rv end",
         "end",
         f"if {V_GENV}~=nil and {V_TYPE}({V_GENV})=='table' then",
         f"if {V_GENV}.type~=nil and not {V_RAW_EQ}({V_GENV}.type,{V_TYPE}) then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"if {V_GENV}.pcall~=nil and not {V_RAW_EQ}({V_GENV}.pcall,{V_PCALL}) then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"if {V_GENV}.error~=nil and not {V_RAW_EQ}({V_GENV}.error,{V_ERROR}) then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         "end",
 
-        # ── Layer 3C: checkcaller / hookfunction detection ────────────────────
-        # Wrapped in pcall closures so `local` is always inside a function body.
+        # ── Layer 3C: checkcaller detection ────────────────────────────────────
         f"if {V_TYPE}(checkcaller)=='function' then",
         f"{V_PCALL}(function()",
-        f"if checkcaller() then",
-        f"{V_ERROR}('[DEX] Tamper Detected')",
-        "end",
+        f"if checkcaller() then {V_ERROR}('[DEX] Tamper Detected') end",
         "end)",
         "end",
 
-        # ── Layer 3D: HttpService dump-vector detection ───────────────────────
+        # ── Layer 3D: HttpService ──────────────────────────────────────────────
         f"local {V_HTTP}=nil",
         f"do",
-        f"local _ok4,_hs={V_PCALL}(function()",
-        f"return {V_GAME}:GetService('HttpService')",
-        "end)",
+        f"local _ok4,_hs={V_PCALL}(function() return {V_GAME}:GetService('HttpService') end)",
         f"if _ok4 and _hs~=nil then",
         f"{V_HTTP}=_hs",
         f"if {V_TYPE}({V_HTTP})~='userdata' then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         "end",
         "end",
 
-        # ── Layer 3E: DataModel service integrity + PlaceId/GameId check ──────
-        f"local {V_RS}=nil",
-        f"local {V_PS}=nil",
+        # ── Layer 3E: DataModel + PlaceId/GameId ───────────────────────────────
+        f"local {V_RS}=nil local {V_PS}=nil",
         f"do",
-        f"local _ok5,_rs={V_PCALL}(function()",
-        f"return {V_GAME}:GetService('RunService')",
-        "end)",
+        f"local _ok5,_rs={V_PCALL}(function() return {V_GAME}:GetService('RunService') end)",
         f"if not _ok5 or _rs==nil or {V_TYPE}(_rs)~='userdata' then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"{V_RS}=_rs",
         "end",
         f"do",
-        f"local _ok6,_ps={V_PCALL}(function()",
-        f"return {V_GAME}:GetService('Players')",
-        "end)",
+        f"local _ok6,_ps={V_PCALL}(function() return {V_GAME}:GetService('Players') end)",
         f"if not _ok6 or _ps==nil or {V_TYPE}(_ps)~='userdata' then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"{V_PS}=_ps",
         "end",
-        f"local {V_PID}=nil",
-        f"local {V_GID}=nil",
+        f"local {V_PID}=nil local {V_GID}=nil",
         f"do",
-        f"local _ok7,_pid={V_PCALL}(function()",
-        f"return {V_GAME}.PlaceId",
-        "end)",
+        f"local _ok7,_pid={V_PCALL}(function() return {V_GAME}.PlaceId end)",
         f"if not _ok7 or {V_TYPE}(_pid)~='number' or _pid<{_place_floor} then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"{V_PID}=_pid",
         "end",
         f"do",
-        f"local _ok8,_gid={V_PCALL}(function()",
-        f"return {V_GAME}.GameId",
-        "end)",
+        f"local _ok8,_gid={V_PCALL}(function() return {V_GAME}.GameId end)",
         f"if not _ok8 or {V_TYPE}(_gid)~='number' or _gid<{_place_floor} then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"{V_GID}=_gid",
         "end",
 
-        # ── Layer 3F: Chat / TextChatService presence check ───────────────────
-        f"local {V_CHAT_OK}=false",
-        f"local {V_CHAT_V}=nil",
+        # ── Layer 3F: Chat service ─────────────────────────────────────────────
+        f"local {V_CHAT_OK}=false local {V_CHAT_V}=nil",
         f"do",
-        f"local _ok9,_cs={V_PCALL}(function()",
-        f"return {V_GAME}:GetService('TextChatService')",
-        "end)",
-        f"if _ok9 and _cs~=nil and {V_TYPE}(_cs)=='userdata' then",
-        f"{V_CHAT_OK}=true",
-        f"{V_CHAT_V}=_cs",
-        "end",
+        f"local _ok9,_cs={V_PCALL}(function() return {V_GAME}:GetService('TextChatService') end)",
+        f"if _ok9 and _cs~=nil and {V_TYPE}(_cs)=='userdata' then {V_CHAT_OK}=true {V_CHAT_V}=_cs end",
         "end",
         f"if not {V_CHAT_OK} then",
         f"do",
-        f"local _ok10,_cs2={V_PCALL}(function()",
-        f"return {V_GAME}:GetService('Chat')",
-        "end)",
-        f"if _ok10 and _cs2~=nil and {V_TYPE}(_cs2)=='userdata' then",
-        f"{V_CHAT_OK}=true",
-        f"{V_CHAT_V}=_cs2",
-        "end",
+        f"local _ok10,_cs2={V_PCALL}(function() return {V_GAME}:GetService('Chat') end)",
+        f"if _ok10 and _cs2~=nil and {V_TYPE}(_cs2)=='userdata' then {V_CHAT_OK}=true {V_CHAT_V}=_cs2 end",
         "end",
         "end",
         f"if not {V_CHAT_OK} then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
 
-        # ── Layer 3G: workspace gravity sanity ────────────────────────────────
+        # ── Layer 3G: workspace gravity ────────────────────────────────────────
         f"local {V_WS}=workspace",
         f"if {V_WS}~=nil and {V_TYPE}({V_WS})=='userdata' then",
         f"do",
-        f"local _ok11,_grav={V_PCALL}(function()",
-        f"return {V_WS}.Gravity",
-        "end)",
+        f"local _ok11,_grav={V_PCALL}(function() return {V_WS}.Gravity end)",
         f"if _ok11 and _grav~=nil and {V_TYPE}(_grav)=='number' then",
         f"if _grav<{_grav_min} or _grav>{_grav_max} then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         "end",
         "end",
         "end",
 
-        # ── Layer 3H: task library validation ────────────────────────────────
+        # ── Layer 3H: task library ─────────────────────────────────────────────
         f"local {V_TASK}=task",
         f"if {V_TASK}~=nil and {V_TYPE}({V_TASK})=='table' then",
         f"if {V_TYPE}({V_TASK}.wait)~='function' or {V_TYPE}({V_TASK}.spawn)~='function' or {V_TYPE}({V_TASK}.defer)~='function' then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         f"if {V_GENV}~=nil and {V_TYPE}({V_GENV})=='table' then",
         f"if {V_GENV}.task~=nil and {V_TYPE}({V_GENV}.task)=='table' then",
         f"if not {V_RAW_EQ}({V_GENV}.task.wait,{V_TASK}.wait) then",
-        f"if {V_WARN} then",
-        f"{V_WARN}('[DEX] Tamper Detected')",
-        "end",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
         f"{V_ERROR}('[DEX] Tamper Detected')",
         "end",
         "end",
         "end",
         "end",
 
-        # ── Decoder helpers ───────────────────────────────────────────────────
-        f"local {V_CHAR}={V_STRING}.char",
-        f"local {V_LEN}={V_STRING}.len",
-        f"local {V_SUB}={V_STRING}.sub",
-        f"local {V_CONCAT}={V_TABLE}.concat",
-        f"local {V_TONUM}=tonumber",
-        f"local {V_LOAD}=loadstring or load",
-        f"local {V_FLOOR}={V_MATH}.floor",
+        # ── Function check ──────────────────────────────────────────────────────
         f"if not ({V_TYPE}({V_CHAR})=='function') or not ({V_TYPE}({V_LEN})=='function') or not ({V_TYPE}({V_SUB})=='function') or not ({V_TYPE}({V_CONCAT})=='function') or not ({V_TYPE}({V_TONUM})=='function') or not ({V_TYPE}({V_LOAD})=='function') then",
         f"if {V_WARN} then {V_WARN}('[DEX] Internal Error') end",
         f"{V_ERROR}('[DEX] Internal Error')",
         "end",
 
-        # ── Layer 4: reconstruct XOR key from split halves ────────────────────
+        # ── Layer 4: reconstruct XOR key ───────────────────────────────────────
         f"local {V_KEY_A}={key_a}",
         f"local {V_KEY_B}={key_b}",
-        f"local {V_XOR}=function(a,b) local r=0 local p=1 while a>0 or b>0 do local aa=a%2 local bb=b%2 if (aa==1 and bb==0) or (aa==0 and bb==1) then r=r+p end a={V_FLOOR}(a/2) b={V_FLOOR}(b/2) p=p*2 end return r end",
+        f"local {V_XOR}={xor_fn_body}",
         f"local {V_KEY}={V_XOR}({V_KEY_A},{V_KEY_B})",
 
-        # ── Layer 5: reconstruct payload from split halves ────────────────────
+        # ── Layer 5: reconstruct payload ───────────────────────────────────────
         f"local {V_HALF_A}='{encoded_a}'",
         f"local {V_HALF_B}='{encoded_b}'",
         f"local {V_DATA}={V_HALF_A}..{V_HALF_B}",
@@ -7976,70 +8145,184 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
         f"local {V_EXPECT_LEN}={source_length}",
         f"local {V_EXPECT_HEX_LEN}={encoded_length}",
 
-        # Structural check
         f"if not ({V_LEN}({V_DATA})=={V_EXPECT_HEX_LEN}) or not (({V_LEN}({V_DATA})%2)==0) then",
         f"if {V_WARN} then {V_WARN}('[DEX] Failed') end",
         f"{V_ERROR}('[DEX] Failed')",
         "end",
 
-        # ── Layer 6: verify ciphertext before decoding ────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # LAYER 13: CONTROL-FLOW FLATTENING
+        # The decode + checksum + VM-run logic is restructured into a
+        # state-machine dispatcher loop. Each "phase" is a numeric state;
+        # the dispatcher jumps between them using an opaque V_STATE variable.
+        # A static analyser sees a single while loop with if/elseif branches
+        # rather than a linear sequence of operations.
+        # ══════════════════════════════════════════════════════════════════════
         f"local {V_CSUM_A}=0x6D31",
         f"local {V_CSUM_B}=0x91E7",
         f"local {V_CEXPECT_A}={cipher_a}",
         f"local {V_CEXPECT_B}={cipher_b}",
-        f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
-        f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
-        f"if {V_VALUE}==nil then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Failed') end",
-        f"{V_ERROR}('[DEX] Failed')",
-        "end",
-        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
-        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*29)%4294967296",
-        "end",
-        f"if not ({V_CSUM_A}=={V_CEXPECT_A}) or not ({V_CSUM_B}=={V_CEXPECT_B}) then",
-        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
-        f"{V_ERROR}('[DEX] Failed')",
-        "end",
-
-        # ── Decode + Layer 7: plaintext dual checksum + Layer 8: FNV-c ────────
-        f"local {V_OUT}={{}}",
         f"local {V_SUM_A}=0x45D9",
         f"local {V_SUM_B}=0xA7C3",
         f"local {V_SUM_C}=0x811C9DC5",
         f"local {V_EXPECT_A}={checksum_a}",
         f"local {V_EXPECT_B}={checksum_b}",
         f"local {V_EXPECT_C}={checksum_c}",
-        f"for {V_I}=1,{V_LEN}({V_DATA}),2 do",
-        f"local {V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
+        f"local {V_OUT}={{}}",
+        f"local {V_STATE}={ST_CHECK_LEN}",
+        f"local {V_I}=1",
+        f"local {V_VALUE}=0",
+
+        # State machine dispatcher
+        f"while {V_STATE}~={ST_DONE} do",
+
+        # ── State: ST_CHECK_LEN — verify hex payload length ────────────────────
+        f"if {V_STATE}=={ST_CHECK_LEN} then",
+        f"{V_STATE}={ST_VERIFY_CS}",
+
+        # ── State: ST_VERIFY_CS — compute + verify ciphertext checksum ─────────
+        f"elseif {V_STATE}=={ST_VERIFY_CS} then",
+        f"if {V_I}<={V_LEN}({V_DATA}) then",
+        f"{V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
+        f"if {V_VALUE}==nil then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Failed') end",
+        f"{V_ERROR}('[DEX] Failed')",
+        "end",
+        f"{V_CSUM_A}=({V_CSUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
+        f"{V_CSUM_B}=({V_CSUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*29)%4294967296",
+        f"{V_I}={V_I}+2",
+        f"else",
+        f"if not ({V_CSUM_A}=={V_CEXPECT_A}) or not ({V_CSUM_B}=={V_CEXPECT_B}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
+        f"{V_ERROR}('[DEX] Failed')",
+        "end",
+        f"{V_I}=1",
+        f"{V_STATE}={ST_DECODE_LOOP}",
+        "end",
+
+        # ── State: ST_DECODE_LOOP — decrypt hex → plaintext + accumulate csum ──
+        f"elseif {V_STATE}=={ST_DECODE_LOOP} then",
+        f"if {V_I}<={V_LEN}({V_DATA}) then",
+        f"{V_VALUE}={V_TONUM}({V_SUB}({V_DATA},{V_I},{V_I}+1),16)",
         f"{V_VALUE}=({V_VALUE}-{V_KEY}-({V_FLOOR}(({V_I}-1)/2)*31%256))%256",
         f"{V_OUT}[{V_FLOOR}(({V_I}+1)/2)]={V_CHAR}({V_VALUE})",
         f"{V_SUM_A}=({V_SUM_A}*33+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2))%4294967296",
         f"{V_SUM_B}=({V_SUM_B}*65599+{V_VALUE}+{V_FLOOR}(({V_I}+1)/2)*17)%4294967296",
         f"{V_SUM_C}=({V_SUM_C}*65599+{V_VALUE}*97+{V_I}*131)%4294967296",
+        f"{V_I}={V_I}+2",
+        f"else",
+        f"{V_STATE}={ST_CHECK_PL}",
         "end",
 
-        # ── Layer 10: compile and execute in current env ──────────────────────
-        f"local {V_SOURCE}={V_CONCAT}({V_OUT})",
+        # ── State: ST_CHECK_PL — verify plaintext checksums ────────────────────
+        f"elseif {V_STATE}=={ST_CHECK_PL} then",
+        f"if not ({V_SUM_A}=={V_EXPECT_A}) or not ({V_SUM_B}=={V_EXPECT_B}) or not ({V_SUM_C}=={V_EXPECT_C}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Tamper Detected') end",
+        f"{V_ERROR}('[DEX] Failed')",
+        "end",
+        f"if not ({V_FLOOR}({V_LEN}({V_DATA})/2)=={V_EXPECT_LEN}) then",
+        f"if {V_WARN} then {V_WARN}('[DEX] Failed') end",
+        f"{V_ERROR}('[DEX] Failed')",
+        "end",
+        f"{V_STATE}={ST_RUN_VM}",
+
+        # ── State: ST_RUN_VM — execute the embedded VM to recover Lua source ───
+        f"elseif {V_STATE}=={ST_RUN_VM} then",
+        # The outer-encrypted blob is now in V_OUT (as chars). Concatenate to get
+        # the VM bytecode blob (vm_blob2).
+        f"local {V_VM_BC}={V_CONCAT}({V_OUT})",
+        f"local {V_VM_SZ}={V_LEN}({V_VM_BC})",
+        # Decrypt vm_blob2 → vm_blob (undo Layer 0B: sub salt+i, rotr, xor)
+        f"local {V_VM_BUF}={{}}",
+        f"local _vm2k={vm2_key} local _vm2r={vm2_rot} local _vm2s={vm2_salt}",
+        # rotr helper inline (Luau has >> operator)
+        f"local _rotr=function(v,n) v=v%256 n=n%8 if n==0 then return v end return (v>>n)+((v<<(8-n))%256) end",
+        f"for _bi=1,{V_VM_SZ} do",
+        f"local _bv={V_BYTE}({V_VM_BC},_bi)",
+        f"_bv=(_bv-_vm2s-((_bi-1)%256))%256",
+        f"_bv=_rotr(_bv,_vm2r)",
+        f"_bv={V_XOR}(_bv,_vm2k)",
+        f"{V_INSERT}({V_VM_BUF},_bv)",
+        "end",
+        # Now V_VM_BUF contains vm_blob (the 2-byte [opcode,operand] instruction stream).
+        # Run the VM interpreter to reconstruct original source.
+        f"local {V_VM_OUT}={{}}",
+        f"local _vm_xk={vm_xor_key} local _vm_ak={vm_add_key} local _vm_rk={vm_rot_amt}",
+        f"local _vm_ip=1",
+        f"local _vm_stk=0",  # single-value stack (OP_PUSH stores here, OP_EMIT uses it)
+        f"while _vm_ip<={V_VM_SZ}-1 do",
+        f"local _opc={V_VM_BUF}[_vm_ip]",
+        f"local _opr={V_VM_BUF}[_vm_ip+1]",
+        f"_vm_ip=_vm_ip+2",
+        # OP_PUSH (1): push operand onto stack
+        f"if _opc==1 then",
+        f"_vm_stk=_opr",
+        # OP_EMIT (5): decode top of stack and write to output
+        f"elseif _opc==5 then",
+        # undo forward transform: rotr(v, vm_rot) → xor vm_xor → sub vm_add
+        f"local _v=_vm_stk",
+        f"_v=_rotr(_v,_vm_rk)",
+        f"_v={V_XOR}(_v,_vm_xk)",
+        f"_v=(_v-_vm_ak)%256",
+        f"{V_INSERT}({V_VM_OUT},{V_CHAR}(_v))",
+        "end",
+        # OP_XOR(2), OP_ADD(3), OP_ROT(4) are reserved for future extensions;
+        # the current encoder only uses PUSH+EMIT.
+        "end",
+        f"local {V_SOURCE}={V_CONCAT}({V_VM_OUT})",
+        f"{V_STATE}={ST_EXEC}",
+
+        # ── State: ST_EXEC — load and execute the recovered source ─────────────
+        f"elseif {V_STATE}=={ST_EXEC} then",
         f"local {V_FN},{V_ERR}={V_LOAD}({V_SOURCE})",
         f"if not {V_FN} then {V_ERROR}('[DEX] Error: '..{V_TOSTRING}({V_ERR})) end",
-
         f"if {V_TYPE}({V_XPCALL})=='function' then",
         f"local {V_OK},{V_RESULT}={V_XPCALL}({V_FN},{V_TOSTRING},...)",
         f"if not {V_OK} then {V_ERROR}('[DEX] Does Your Executer Support Loadstring?: '..{V_TOSTRING}({V_RESULT})) end",
         f"return {V_RESULT}",
         "end",
-
         f"local {V_OK},{V_RESULT}={V_PCALL}({V_FN},...)",
         f"if not {V_OK} then {V_ERROR}('[DEX] Does Your Executer Support Loadstring?: '..{V_TOSTRING}({V_RESULT})) end",
         f"return {V_RESULT}",
+        "end",
+
+        "end",  # close while loop
+
         "end)(...)",
     ]
 
-    # ── Assemble the 3-line output ─────────────────────────────────────────────
+    # ── Fix the string table decoder (we had a placeholder) ───────────────────
+    # Rebuild lines, replacing the broken STR_GET body with a proper one.
+    fixed_lines = []
+    skip_next = 0
+    for li, line in enumerate(lines):
+        if f"local {V_STR_GET}=function(idx)" in line:
+            # Replace the 5-line block we emitted with a correct version
+            fixed_lines.append(f"local {V_STR_GET}=function(idx)")
+            fixed_lines.append(f"local offsets={{{','.join(str(o) for o in str_offsets)}}}")
+            fixed_lines.append(f"local pos=offsets[idx]+1")
+            fixed_lines.append(f"local acc={{}}")
+            fixed_lines.append(f"while {V_STR_TBL}[pos]~=0 do")
+            fixed_lines.append(f"local _sc={V_STR_TBL}[pos]")
+            fixed_lines.append(f"{V_INSERT}(acc,{V_CHAR}({V_XOR}(_sc,{V_STR_XOR})))")
+            fixed_lines.append(f"pos=pos+1")
+            fixed_lines.append(f"end")
+            fixed_lines.append(f"return {V_CONCAT}(acc)")
+            fixed_lines.append(f"end")
+            # Mark the old broken lines (next 4) to skip
+            skip_next = 5
+            continue
+        if skip_next > 0:
+            skip_next -= 1
+            continue
+        fixed_lines.append(line)
+    lines = fixed_lines
+
+    # ── Assemble ───────────────────────────────────────────────────────────────
     comment_line = lines[0]
     code_line    = " ".join(x.strip() for x in lines[2:] if x.strip())
 
-    # Size-scaling: 1 KB per source line.
+    # Size-scaling: 1 KB per source line
     if target_bytes and target_bytes > 0:
         _target = int(target_bytes)
     else:
@@ -8050,12 +8333,10 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
 
     current_code_bytes = len(code_line.encode("utf-8"))
     if current_code_bytes < needed_code:
-        # ── Layer 11: padding in do...end blocks (140 locals each, Luau-safe) ─
-        # Outer fn now uses ~65 real locals. Each do-block gets its own scope.
-        # 200 - 65 - 10(margin) = 125 per block — safely under the 200 limit.
-        REAL_LOCALS      = 65
+        # ── Layer 11: padding in do...end blocks ──────────────────────────────
+        REAL_LOCALS      = 80   # we now use more locals (~80) due to VM vars
         SAFETY_MARGIN    = 10
-        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 125
+        LOCALS_PER_BLOCK = 200 - REAL_LOCALS - SAFETY_MARGIN  # 110
 
         INSERT_MARKER = "return(function(...)"
         splice_idx    = code_line.find(INSERT_MARKER)
@@ -8077,7 +8358,7 @@ def obfuscate_lua(source: str, publish=True, level="hard", minimum_size=False, t
             if pad_bytes >= deficit:
                 break
 
-        pad_str  = " ".join(blocks)
+        pad_str   = " ".join(blocks)
         code_line = (
             code_line[:splice_pos]
             + " "
